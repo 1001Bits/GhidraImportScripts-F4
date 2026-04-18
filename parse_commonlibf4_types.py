@@ -5,7 +5,7 @@ Parse CommonLibF4 headers using libclang and generate Ghidra import scripts
 definitions and apply named symbols at known addresses.
 
 Ports doodlum/GhidraImportScripts (CommonLibSSE) to CommonLibF4 (libxse fork).
-Targets three F4 versions: OG (1.10.163), NG (1.11.191), VR (1.2.72).
+Targets four F4 versions: OG (1.10.163), NG (1.10.984), AE (1.11.191), VR (1.2.72).
 
 Requires Python 3.x (64-bit) with the libclang package installed.
 Run with: py -3.13 parse_commonlibf4_types.py
@@ -21,11 +21,13 @@ CommonLibF4 uses single-version address-library IDs everywhere:
   static REL::Relocation<func_t> func{ REL::Offset(0x12345) };  // VR-style
 
 There is no RELOCATION_ID(se, ae) macro and no per-call multi-version pair.
-A single ID resolves to different RVAs in OG / NG / VR address libraries.
+A single ID resolves to an RVA via whichever address library matches the
+runtime binary.
 
-NG (1.11.191) is the primary coverage target — IDs_RTTI.h / IDs_VTABLE.h
-contain IDs up to ~8.7M which only resolve in the NG addrlib.  OG (1.58M
-max ID) and VR (same as OG) get partial coverage.
+NG (1.10.984) and AE (1.11.191) share a single ID namespace with ~59% overlap
+(each version also has IDs unique to its build).  CommonLibF4 IDs resolve
+cleanly against both DBs.  OG (1.10.163) and VR (1.2.72) use disjoint ID
+namespaces — their scripts emit as scaffolding only (0 symbols).
 
 --------------------------------------------------------------------------------
 KNOWN LIMITATIONS
@@ -69,10 +71,10 @@ TEMPLATE INSTANTIATIONS
   parameter types, not the concrete substituted types.
 
 OG / VR ID COVERAGE
-  Most RTTI/VTABLE IDs in IDs_RTTI.h / IDs_VTABLE.h are above 1.6M, which means
-  they are absent from the OG (1.10.163) and VR (1.2.72) address libraries.
-  The OG and VR emit passes will skip those symbols silently — only the IDs
-  that exist in the target version's CSV/bin are written into that script.
+  CommonLibF4's IDs live in the NG/AE namespace.  OG (1.10.163) and VR (1.2.72)
+  use disjoint ID spaces, so their emitted scripts have 0 symbols.  Types and
+  enums are still applied by those scripts; only the symbol list is empty.
+  Proper OG/VR symbol coverage would need an external cross-version ID mapping.
 
 32-BIT PYTHON
   libclang.dll is 64-bit; the script will exit at startup on 32-bit Python
@@ -138,16 +140,18 @@ EXTRA_TYPES_JSON = os.path.join(SCRIPT_DIR, 'extra_types.json')
 # ---------------------------------------------------------------------------
 
 class AddressLibrary:
-    """Loads F4 address-library databases for OG / NG / VR mapping IDs to RVAs.
+    """Loads F4 address-library databases for OG / NG / AE / VR mapping IDs to RVAs.
 
     F4 uses a simpler V0 format than SE/AE: a raw uint64 count followed by an
-    array of (uint64 id, uint64 offset) pairs. VR ships as a CSV with a header
-    line and a metadata line '<count>,<format_version>' to skip."""
+    array of (uint64 id, uint64 offset) pairs. NG (1.10.984) ships as a flat
+    CSV with an 'id,fo4_addr' header.  VR ships as a CSV with a header line
+    plus a metadata line '<count>,<format_version>' to skip."""
 
     def __init__(self):
-        self.f4og_db = {}  # 1.10.163
-        self.f4ng_db = {}  # 1.11.191 (current NG, covers 4M+ RTTI/VTABLE IDs)
-        self.f4vr_db = {}  # 1.2.72
+        self.f4og_db = {}  # 1.10.163 — disjoint ID namespace from NG/AE
+        self.f4ng_db = {}  # 1.10.984 (Next Gen) — shares ID namespace with AE
+        self.f4ae_db = {}  # 1.11.191 (latest) — primary CommonLibF4 coverage
+        self.f4vr_db = {}  # 1.2.72   — disjoint ID namespace
 
     def load_bin_v0(self, file_path):
         if not os.path.exists(file_path):
@@ -188,7 +192,8 @@ class AddressLibrary:
 
     def load_all(self, base_path):
         self.f4og_db = self.load_bin_v0(os.path.join(base_path, 'version-1-10-163-0.bin'))
-        self.f4ng_db = self.load_bin_v0(os.path.join(base_path, 'version-1-11-191-0.bin'))
+        self.f4ng_db = self.load_csv(os.path.join(base_path, 'offsets-1-10-984-0.csv'))
+        self.f4ae_db = self.load_bin_v0(os.path.join(base_path, 'version-1-11-191-0.bin'))
         self.f4vr_db = self.load_csv(os.path.join(base_path, 'version-1-2-72-0.csv'), skip_meta=True)
 
 
@@ -253,6 +258,11 @@ VERSIONS = {
         'defines':     ['-DFALLOUT=163', '-DFALLOUT_VERSION_MAJOR=1'],
         'pdb':         os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_F4NG_D.pdb'),
         'output':      os.path.join(OUTPUT_DIR, 'CommonLibImport_F4NG.py'),
+    },
+    'f4ae': {
+        'defines':     ['-DFALLOUT=163', '-DFALLOUT_VERSION_MAJOR=1'],
+        'pdb':         os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_F4AE_D.pdb'),
+        'output':      os.path.join(OUTPUT_DIR, 'CommonLibImport_F4AE.py'),
     },
     'f4vr': {
         'defines':     ['-DFALLOUT=43', '-DFALLOUT_VERSION_MAJOR=1', '-DFALLOUTVR'],
@@ -1351,7 +1361,7 @@ def _import_types():
 
 
 def _import_symbols():
-    version_key = {'f4og': 'og', 'f4ng': 'ng', 'f4vr': 'vr'}[VERSION]
+    version_key = {'f4og': 'og', 'f4ng': 'ng', 'f4ae': 'ae', 'f4vr': 'vr'}[VERSION]
     symbol_table = currentProgram.getSymbolTable()
     base_addr = currentProgram.getImageBase()
     fm = currentProgram.getFunctionManager()
@@ -1651,7 +1661,7 @@ def _import_fallback_symbols():
     Runs after _import_vtable_names() so any function already named by the
     vtable walk or the main symbol pass is left untouched.
     """
-    version_key = {'f4og': 'og', 'f4ng': 'ng', 'f4vr': 'vr'}[VERSION]
+    version_key = {'f4og': 'og', 'f4ng': 'ng', 'f4ae': 'ae', 'f4vr': 'vr'}[VERSION]
     base_addr = currentProgram.getImageBase()
     fm = currentProgram.getFunctionManager()
     symbol_table = currentProgram.getSymbolTable()
@@ -2683,7 +2693,7 @@ def _collect_src_relocations(src_dir, addr_lib, id_map=None):
     # F4 is version-agnostic at the header level — parse once with the default
     # NG-targeted defines and return ID-bearing symbols.  Per-version resolution
     # happens in main() against the three address databases.
-    cfg = VERSIONS['f4ng']
+    cfg = VERSIONS['f4ae']
     parse_args = PARSE_ARGS_BASE + cfg['defines']
     idx = ci.Index.create()
     tu = idx.parse(
@@ -2840,13 +2850,14 @@ def main():
     # Load address databases (binary V0 for OG/NG, CSV for VR)
     addr_lib = AddressLibrary()
     addr_lib.load_all(os.path.join(SCRIPT_DIR, 'addresslibrary'))
-    print('Address DBs — OG: {}, NG: {}, VR: {}'.format(
-        len(addr_lib.f4og_db), len(addr_lib.f4ng_db), len(addr_lib.f4vr_db)))
+    print('Address DBs — OG: {}, NG: {}, AE: {}, VR: {}'.format(
+        len(addr_lib.f4og_db), len(addr_lib.f4ng_db),
+        len(addr_lib.f4ae_db), len(addr_lib.f4vr_db)))
 
     # F4 headers are version-agnostic — one libclang pass yields all ID-bearing
     # symbols.  Per-version resolution is done afterwards against the three DBs.
     print('\n=== Collecting symbols via libclang ===')
-    cfg = VERSIONS['f4ng']
+    cfg = VERSIONS['f4ae']
     parse_args = PARSE_ARGS_BASE + cfg['defines']
     print('\n--- Fallout.h relocation scan ---')
     idx = ci.Index.create()
@@ -2889,14 +2900,16 @@ def main():
     for lbl in hdr_labels:
         label_by_name.setdefault(lbl['name'], lbl)
 
-    # CommonLibF4 REL::ID values live in the NG (1.10.980+) namespace — the
-    # OG (1.10.163) and VR (1.2.72) address libraries use separate, disjoint
-    # ID namespaces.  Resolving NG IDs against OG/VR DBs by coincidence would
-    # produce incorrect offsets (wrong functions), so only the NG DB is used.
-    # OG/VR support would need an external cross-version ID mapping table.
+    # CommonLibF4 REL::ID values live in the NG/AE (1.10.980+) namespace —
+    # NG (1.10.984) and AE (1.11.191) share the same ID space (with ~59%
+    # overlap; each version also has IDs unique to its build), so the same
+    # ID resolves in one or both of those DBs.  The OG (1.10.163) and VR
+    # (1.2.72) libraries use separate, disjoint namespaces, so resolving
+    # a CommonLibF4 ID against them would produce incorrect offsets.
     # Keys are 2-char to avoid colliding with the 'n' (name) symbol key.
     DB_KEYS = (
         ('ng', addr_lib.f4ng_db),
+        ('ae', addr_lib.f4ae_db),
     )
 
     def _resolve(sym, id_val):
@@ -2924,7 +2937,7 @@ def main():
         if id_val:
             sym['id'] = id_val
         _resolve(sym, id_val)
-        if 'ng' in sym:
+        if 'ng' in sym or 'ae' in sym:
             symbols.append(sym)
 
     for lbl in label_by_name.values():
@@ -2935,7 +2948,7 @@ def main():
         if id_val:
             sym['id'] = id_val
         _resolve(sym, id_val)
-        if 'ng' in sym:
+        if 'ng' in sym or 'ae' in sym:
             symbols.append(sym)
 
     # Normalize __ → :: in all names
@@ -2946,16 +2959,20 @@ def main():
     funcs = [s for s in symbols if s['t'] == 'func']
     with_sig = len([s for s in funcs if s.get('sig')])
     labels_count = len([s for s in symbols if s['t'] == 'label'])
-    print('\nGenerated {} symbols (NG namespace):'.format(len(symbols)))
+    n_ng = len([s for s in symbols if 'ng' in s])
+    n_ae = len([s for s in symbols if 'ae' in s])
+    print('\nGenerated {} symbols (NG/AE namespace):'.format(len(symbols)))
     print('  Functions: {} ({} with signatures)'.format(len(funcs), with_sig))
     print('  Labels: {}'.format(labels_count))
+    print('  Resolved per version — NG: {}, AE: {}'.format(n_ng, n_ae))
 
     symbols_json = _json.dumps(symbols, separators=(',', ':'))
 
-    # Only NG has meaningful symbol resolution; the OG and VR scripts are
-    # still emitted but will be empty (no symbols match in their namespaces).
-    # They exist so downstream tooling sees the same three-script layout.
-    for version in ('f4og', 'f4ng', 'f4vr'):
+    # NG (1.10.984) and AE (1.11.191) both resolve CommonLibF4 IDs.
+    # OG and VR scripts are still emitted but will be empty (disjoint
+    # ID namespaces) — they exist so downstream tooling sees the same
+    # four-script layout.
+    for version in ('f4og', 'f4ng', 'f4ae', 'f4vr'):
         run_version(version, symbols_json, '[]')
 
 
