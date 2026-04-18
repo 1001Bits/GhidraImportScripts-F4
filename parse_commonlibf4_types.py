@@ -2380,7 +2380,7 @@ def _flatten_structs(structs):
     print('Flattening: {} structs have field data after inheritance expansion'.format(gained))
 
 
-def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
+def _collect_relocations_from_tu(tu, extra_id_map=None):
     """Walk the CommonLibF4 AST to collect function symbols and RTTI/VTABLE labels.
 
     For function symbols: finds VAR_DECL nodes whose type contains 'REL::Relocation<'.
@@ -2390,19 +2390,22 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
 
     For RTTI_*/VTABLE_* labels: reads the first integer literal from the constructor.
 
-    Handles Offset:: references (used instead of RELOCATION_ID in some headers) by
-    pre-scanning REL::ID VAR_DECLs in the Offset namespace and following DECL_REF_EXPR
-    links at use sites.
+    Handles ID:: references (named REL::ID vars, e.g. ID::Actor::AddPerk) by
+    pre-scanning REL::ID VAR_DECLs in the ID / Offset namespaces and following
+    DECL_REF_EXPR links at use sites.
 
-    is_ae: when True, RELOCATION_ID expands to REL::RelocationID(se, ae) → 2 integers.
-           when False, it expands to REL::ID(se) → 1 integer.
+    F4 uses a single version-agnostic ID namespace: each call site carries one
+    address-library ID that resolves to different RVAs in OG / NG / VR via
+    separate databases.  Resolution happens at emit time, not scan time.
 
-    Returns (func_syms, label_syms):
-      func_syms: [{'name','class_','ret','params','is_static','se_off','ae_off'}, ...]
-      label_syms: [{'name','se_off','ae_off'}, ...]
+    Returns (func_syms, label_syms, id_map, static_methods):
+      func_syms:  [{'name','class_','ret','params','is_static','id'}, ...]
+      label_syms: [{'name','id'}, ...]
+      id_map:     {qualified_name: id} for ID:: / Offset:: namespace vars
+      static_methods: {(class, method)} frozen set of static CXX_METHODs
     """
-    # --- Step 1: Build lookup for Offset:: REL::ID vars ---
-    # e.g. RE::Offset::Actor::AddShout → integer ID
+    # --- Step 1: Build lookup for ID:: / Offset:: REL::ID vars ---
+    # e.g. RE::ID::Actor::AddPerk → integer ID
     offset_id_map = {}  # stripped_qual_name → integer_id
 
     def get_int_literals(cursor, depth=0):
@@ -2485,7 +2488,7 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
                 ids = get_int_literals(cursor)
                 if ids:
                     full = _get_full_qual_name(cursor)
-                    for pfx in ('RE::Offset::', 'Offset::'):
+                    for pfx in ('RE::ID::', 'RE::Offset::', 'ID::', 'Offset::'):
                         if full.startswith(pfx):
                             full = full[len(pfx):]
                             break
@@ -2494,14 +2497,14 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
             _scan_offset_ids(c, depth + 1)
 
     _scan_offset_ids(tu.cursor)
-    if extra_offset_map:
-        offset_id_map.update(extra_offset_map)
+    if extra_id_map:
+        offset_id_map.update(extra_id_map)
 
     # --- Step 2: Collect function symbols and labels ---
     func_syms = []
     label_syms = []
-    seen_se = set()
-    seen_ae = set()
+    seen_ids = set()
+    seen_label_ids = set()
 
     def parse_reloc_spelling(type_sp):
         """Parse 'REL::Relocation<T>' to (ret, class_or_None, params) as C++ strings."""
@@ -2523,44 +2526,44 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
         return inner[:last_open].strip(), None, inner[last_open+1:-1].strip()
 
     def get_offset_ref_ids(cursor, depth=0):
-        """Follow a DECL_REF_EXPR to a REL::ID var in the Offset namespace."""
-        if depth > 8: return None, None
+        """Follow a DECL_REF_EXPR to a REL::ID var in the ID / Offset namespace."""
+        if depth > 8: return None
         if cursor.kind == ci.CursorKind.DECL_REF_EXPR and cursor.referenced:
             full = _get_full_qual_name(cursor.referenced)
-            for pfx in ('RE::Offset::', 'Offset::'):
+            for pfx in ('RE::ID::', 'RE::Offset::', 'ID::', 'Offset::'):
                 if full.startswith(pfx):
                     full = full[len(pfx):]
                     break
             the_id = offset_id_map.get(full)
             if the_id:
-                return (the_id, None) if not is_ae else (None, the_id)
+                return the_id
         for c in cursor.get_children():
             r = get_offset_ref_ids(c, depth + 1)
-            if r != (None, None): return r
-        return None, None
+            if r is not None: return r
+        return None
 
     def get_offset_from_tokens(parent_cursor, var_name):
-        """Token-stream fallback for Offset:: refs whose DECL_REF_EXPR doesn't resolve.
+        """Token-stream fallback for ID:: refs whose DECL_REF_EXPR doesn't resolve.
 
-        Used when parsing src/.cpp files without the Offset namespace in scope:
+        Used when parsing src/.cpp files without the ID namespace in scope:
         reconstruct 'ClassName::Method' from tokens and look it up in offset_id_map.
         """
         tokens = [t.spelling for t in parent_cursor.get_tokens()]
         try:
             var_idx = len(tokens) - 1 - tokens[::-1].index(var_name)
         except ValueError:
-            return None, None
-        # Scan initializer { ... } for 'Offset :: Parts :: ...'
+            return None
+        # Scan initializer { ... } for 'ID :: Parts :: ...' or 'Offset :: Parts :: ...'
         toks = tokens[var_idx + 1:]
         try:
             brace = toks.index('{')
         except ValueError:
-            return None, None
+            return None
         parts = []
         i = brace + 1
         while i < len(toks) and toks[i] not in ('}', ';'):
-            if toks[i] == 'Offset' and i + 1 < len(toks) and toks[i + 1] == '::':
-                i += 2  # skip 'Offset' '::'
+            if toks[i] in ('ID', 'Offset') and i + 1 < len(toks) and toks[i + 1] == '::':
+                i += 2  # skip 'ID'/'Offset' '::'
                 while i < len(toks) and toks[i] not in ('}', ';', ','):
                     if toks[i] != '::':
                         parts.append(toks[i])
@@ -2568,12 +2571,9 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
                 break
             i += 1
         if not parts:
-            return None, None
+            return None
         key = '::'.join(parts)
-        the_id = offset_id_map.get(key)
-        if the_id is None:
-            return None, None
-        return (the_id, None) if not is_ae else (None, the_id)
+        return offset_id_map.get(key)
 
     def params_to_str(func_cursor):
         try:
@@ -2637,32 +2637,24 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
                 # (libclang doesn't expose static local initializers as VAR_DECL children)
                 if not ids and parent is not None:
                     ids = get_ints_from_token_stream(parent, var_name)
-                se_id = ae_id = None
-                if is_ae:
-                    if len(ids) >= 2: se_id, ae_id = ids[0], ids[1]
-                    elif len(ids) == 1: ae_id = ids[0]
-                else:
-                    if ids: se_id = ids[0]
+                the_id = ids[0] if ids else None
 
-                # Fall back to Offset:: reference lookup (AST-based, then token-based)
-                if not se_id and not ae_id:
-                    se_id, ae_id = get_offset_ref_ids(cursor)
-                # Token fallback: DECL_REF_EXPR doesn't resolve when the Offset
+                # Fall back to ID:: reference lookup (AST-based, then token-based)
+                if the_id is None:
+                    the_id = get_offset_ref_ids(cursor)
+                # Token fallback: DECL_REF_EXPR doesn't resolve when the ID
                 # namespace wasn't in scope during parsing (e.g. unity src/ parse).
-                if not se_id and not ae_id and parent is not None:
-                    se_id, ae_id = get_offset_from_tokens(parent, var_name)
+                if the_id is None and parent is not None:
+                    the_id = get_offset_from_tokens(parent, var_name)
 
-                se_off = addr_lib.se_db.get(se_id) if se_id else None
-                ae_off = addr_lib.ae_db.get(ae_id) if ae_id else None
-
-                if not se_off and not ae_off and not is_ae:
+                if the_id is None:
                     f = cursor.location.file
                     fname_short = os.path.basename(f.name) if f else '?'
                     sym = (enc_name or var_name)
                     cls = enc_class or ''
-                    _missed_relocs.append((fname_short, cursor.location.line, cls, sym, se_id, ae_id))
-
-                if se_off or ae_off:
+                    _missed_relocs.append((fname_short, cursor.location.line, cls, sym))
+                elif the_id not in seen_ids:
+                    seen_ids.add(the_id)
                     if enc_name and enc_name.lower() not in _GENERIC_VAR_NAMES:
                         sym_name = enc_name
                         sym_class = enc_class
@@ -2677,65 +2669,32 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
                         sym_params = sig[2] if sig else ''
                         sym_static = False
 
-                    # Deduplicate by SE offset (prefer) then AE offset
-                    if se_off and se_off not in seen_se:
-                        seen_se.add(se_off)
-                        if ae_off: seen_ae.add(ae_off)
-                        func_syms.append({
-                            'name': sym_name, 'class_': sym_class,
-                            'ret': sym_ret, 'params': sym_params,
-                            'is_static': sym_static,
-                            'se_off': se_off, 'ae_off': ae_off,
-                        })
-                    elif ae_off and ae_off not in seen_ae:
-                        seen_ae.add(ae_off)
-                        func_syms.append({
-                            'name': sym_name, 'class_': sym_class,
-                            'ret': sym_ret, 'params': sym_params,
-                            'is_static': sym_static,
-                            'se_off': None, 'ae_off': ae_off,
-                        })
+                    func_syms.append({
+                        'name': sym_name, 'class_': sym_class,
+                        'ret': sym_ret, 'params': sym_params,
+                        'is_static': sym_static,
+                        'id': the_id,
+                    })
 
             elif (type_sp == 'int' and enc_name and
                   enc_name.lower() not in _GENERIC_VAR_NAMES and
                   parent is not None):
                 # REL::Relocation<func_t> degrades to 'int' under libclang error
                 # recovery when complex template parameter types fail to instantiate
-                # (e.g. BSScrapArray<ActorHandle>* params in unity src/ parse).
-                # The enclosing CXX_METHOD context (enc_name/enc_class/enc_ret/enc_params)
-                # is still correct — only the VAR_DECL type is broken.
+                # in unity src/ parse.  Enclosing CXX_METHOD context remains correct.
                 ids = get_ints_from_token_stream(parent, var_name)
-                se_id = ae_id = None
-                if ids:
-                    if is_ae:
-                        if len(ids) >= 2: se_id, ae_id = ids[0], ids[1]
-                        elif len(ids) == 1: ae_id = ids[0]
-                    else:
-                        if ids: se_id = ids[0]
-                if not se_id and not ae_id:
-                    se_id, ae_id = get_offset_from_tokens(parent, var_name)
+                the_id = ids[0] if ids else None
+                if the_id is None:
+                    the_id = get_offset_from_tokens(parent, var_name)
 
-                se_off = addr_lib.se_db.get(se_id) if se_id else None
-                ae_off = addr_lib.ae_db.get(ae_id) if ae_id else None
-
-                if se_off or ae_off:
-                    if se_off and se_off not in seen_se:
-                        seen_se.add(se_off)
-                        if ae_off: seen_ae.add(ae_off)
-                        func_syms.append({
-                            'name': enc_name, 'class_': enc_class,
-                            'ret': enc_ret, 'params': enc_params,
-                            'is_static': enc_static,
-                            'se_off': se_off, 'ae_off': ae_off,
-                        })
-                    elif ae_off and ae_off not in seen_ae:
-                        seen_ae.add(ae_off)
-                        func_syms.append({
-                            'name': enc_name, 'class_': enc_class,
-                            'ret': enc_ret, 'params': enc_params,
-                            'is_static': enc_static,
-                            'se_off': None, 'ae_off': ae_off,
-                        })
+                if the_id is not None and the_id not in seen_ids:
+                    seen_ids.add(the_id)
+                    func_syms.append({
+                        'name': enc_name, 'class_': enc_class,
+                        'ret': enc_ret, 'params': enc_params,
+                        'is_static': enc_static,
+                        'id': the_id,
+                    })
 
             elif var_name.startswith(('RTTI_', 'VTABLE_')):
                 # Try forward-tokenization first (reads past cursor extent).
@@ -2750,16 +2709,9 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
                         ids = ids[1:]
                 if ids:
                     the_id = ids[0]
-                    if is_ae:
-                        off = addr_lib.ae_db.get(the_id)
-                        if off and the_id not in seen_ae:
-                            seen_ae.add(the_id)
-                            label_syms.append({'name': var_name, 'se_off': None, 'ae_off': off})
-                    else:
-                        off = addr_lib.se_db.get(the_id)
-                        if off and the_id not in seen_se:
-                            seen_se.add(the_id)
-                            label_syms.append({'name': var_name, 'se_off': off, 'ae_off': None})
+                    if the_id not in seen_label_ids:
+                        seen_label_ids.add(the_id)
+                        label_syms.append({'name': var_name, 'id': the_id})
 
         for c in cursor.get_children():
             walk(c, cursor, enc_name, enc_class, enc_ret, enc_params, enc_static, depth + 1)
@@ -2767,11 +2719,10 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
     _missed_relocs = []
     walk(tu.cursor)
 
-    if not is_ae and _missed_relocs:
-        print('  Missed REL::Relocation<> VAR_DECLs (no address resolved):')
-        for fname_short, line, cls, sym, se_id, ae_id in sorted(_missed_relocs):
-            id_str = 'se_id={} ae_id={}'.format(se_id, ae_id)
-            print('    {}:{} {}::{} ({})'.format(fname_short, line, cls, sym, id_str))
+    if _missed_relocs:
+        print('  Missed REL::Relocation<> VAR_DECLs (no ID resolved):')
+        for fname_short, line, cls, sym in sorted(_missed_relocs):
+            print('    {}:{} {}::{}'.format(fname_short, line, cls, sym))
 
     # Collect static method declarations from header AST so _scan_src_files can
     # correctly mark static methods even when their .cpp definition lacks 'static'.
@@ -2791,9 +2742,8 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
 
     _scan_static_methods(tu.cursor)
 
-    mode = 'AE' if is_ae else 'SE'
-    print('  {} relocation scan: {} func symbols, {} labels, {} static methods'.format(
-        mode, len(func_syms), len(label_syms), len(static_methods)))
+    print('  F4 ID scan: {} func symbols, {} labels, {} static methods'.format(
+        len(func_syms), len(label_syms), len(static_methods)))
     return func_syms, label_syms, offset_id_map, static_methods
 
 
@@ -2836,49 +2786,30 @@ def _collect_src_relocations(src_dir, addr_lib, id_map=None):
     # files resolve against the same directory they would during a real build.
     unity_vpath = os.path.join(src_dir, '_unity_parse.cpp').replace('\\', '/')
 
-    se_funcs = []
-    ae_funcs = []
-
-    for version, is_ae in (('se', False), ('ae', True)):
-        cfg = VERSIONS[version]
-        parse_args = PARSE_ARGS_BASE + cfg['defines']
-        idx = ci.Index.create()
-        tu = idx.parse(
-            unity_vpath,
-            args=parse_args,
-            unsaved_files=[(unity_vpath, unity_content)],
-            options=PARSE_OPTIONS_FULL,
-        )
-        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error
-                  and 'binary_io/file_stream.hpp' not in d.spelling]
-        if errors:
-            print('  src/ {} unity errors ({} total, first 5):'.format(
-                version.upper(), len(errors)))
-            for e in errors[:5]:
-                f = e.location.file
-                print('    {}:{}: {}'.format(
-                    os.path.basename(f.name) if f else '?', e.location.line, e.spelling))
-        extra = ae_offset_map if is_ae else se_offset_map
-        fs, _ls, _off_map, _sm = _collect_relocations_from_tu(
-            tu, addr_lib, is_ae, extra_offset_map=extra)
-        print('  src/ {} scan: {} func symbols'.format(version.upper(), len(fs)))
-        if is_ae:
-            ae_funcs = fs
-        else:
-            se_funcs = fs
-
-    # Merge: AE funcs have both offsets from RELOCATION_ID(se, ae).
-    # Add any SE-only funcs (Offset:: refs that only yield a SE ID).
-    seen_se = {f['se_off'] for f in ae_funcs if f['se_off']}
-    merged  = list(ae_funcs)
-    for f in se_funcs:
-        if f['se_off'] and f['se_off'] not in seen_se:
-            seen_se.add(f['se_off'])
-            merged.append(f)
-
+    # F4 is version-agnostic at the header level — parse once with the default
+    # NG-targeted defines and return ID-bearing symbols.  Per-version resolution
+    # happens in main() against the three address databases.
+    cfg = VERSIONS['f4ng']
+    parse_args = PARSE_ARGS_BASE + cfg['defines']
+    idx = ci.Index.create()
+    tu = idx.parse(
+        unity_vpath,
+        args=parse_args,
+        unsaved_files=[(unity_vpath, unity_content)],
+        options=PARSE_OPTIONS_FULL,
+    )
+    errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error
+              and 'binary_io/file_stream.hpp' not in d.spelling]
+    if errors:
+        print('  src/ unity errors ({} total, first 5):'.format(len(errors)))
+        for e in errors[:5]:
+            f = e.location.file
+            print('    {}:{}: {}'.format(
+                os.path.basename(f.name) if f else '?', e.location.line, e.spelling))
+    fs, _ls, _off_map, _sm = _collect_relocations_from_tu(tu, extra_id_map=id_map)
     print('  src/ merged: {} func symbols from {} cpp files'.format(
-        len(merged), len(cpp_files)))
-    return merged
+        len(fs), len(cpp_files)))
+    return fs
 
 
 def run_version(version, symbols_json, fallback_symbols_json='[]'):
