@@ -1,10 +1,31 @@
 #!/usr/bin/env python3
 """
-Parse CommonLibSSE headers using libclang and generate a Ghidra import script
-(ghidrascripts/CommonLibTypes.py) that creates struct/class/enum type definitions.
+Parse CommonLibF4 headers using libclang and generate Ghidra import scripts
+(ghidrascripts/CommonLibImport_F4*.py) that create struct/class/enum type
+definitions and apply named symbols at known addresses.
+
+Ports doodlum/GhidraImportScripts (CommonLibSSE) to CommonLibF4 (libxse fork).
+Targets three F4 versions: OG (1.10.163), NG (1.11.191), VR (1.2.72).
 
 Requires Python 3.x (64-bit) with the libclang package installed.
-Run with: py -3.13 parse_commonlib_types.py
+Run with: py -3.13 parse_commonlibf4_types.py
+
+--------------------------------------------------------------------------------
+F4 vs SE PATTERN DIFFERENCES
+--------------------------------------------------------------------------------
+
+CommonLibF4 uses single-version address-library IDs everywhere:
+
+  static REL::Relocation<func_t> func{ ID::Actor::AddPerk };
+  static REL::Relocation<func_t> func{ REL::ID(2230121) };
+  static REL::Relocation<func_t> func{ REL::Offset(0x12345) };  // VR-style
+
+There is no RELOCATION_ID(se, ae) macro and no per-call multi-version pair.
+A single ID resolves to different RVAs in OG / NG / VR address libraries.
+
+NG (1.11.191) is the primary coverage target — IDs_RTTI.h / IDs_VTABLE.h
+contain IDs up to ~8.7M which only resolve in the NG addrlib.  OG (1.58M
+max ID) and VR (same as OG) get partial coverage.
 
 --------------------------------------------------------------------------------
 KNOWN LIMITATIONS
@@ -12,65 +33,28 @@ KNOWN LIMITATIONS
 
 FUNCTION SIGNATURES — src/ unity parse
   When a .cpp file's REL::Relocation<func_t> VAR_DECL fails to instantiate (due
-  to complex template parameter types such as BSScrapArray<ActorHandle>* that are
+  to complex template parameter types such as BSTArray<ActorHandle>* that are
   only partially resolved under libclang's error recovery), the VAR_DECL type
   degrades to 'int'.  A token-stream fallback recovers the offset/address in that
   case, but the parameter types in the emitted signature are taken from the
-  enclosing CXX_METHOD cursor — which also shows degraded types (e.g. 'int *'
-  instead of 'BSScrapArray<ActorHandle> *').  The function is found at the correct
-  address; only the parameter type spelling is wrong.
+  enclosing CXX_METHOD cursor — which also shows degraded types.  The function
+  is found at the correct address; only the parameter type spelling is wrong.
 
-FUNCTION SIGNATURES — Offset:: namespace
-  Functions that use RE::Offset:: IDs (instead of RELOCATION_ID()) resolve via a
-  two-stage fallback: AST DECL_REF_EXPR first, then raw token scan.  The token
-  fallback only recognises the pattern 'Offset::X::Y' immediately after '{'; more
-  exotic initialisers (nested templates, macros that expand to Offset references)
-  are silently skipped.
+FUNCTION SIGNATURES — ID:: namespace
+  Functions that use RE::ID:: IDs (named REL::ID vars, not literal REL::ID(N))
+  resolve via a two-stage fallback: AST DECL_REF_EXPR first, then raw token scan.
+  The token fallback only recognises the pattern 'ID::X::Y' immediately after
+  '{'; more exotic initialisers (nested templates, macros that expand to ID
+  references) are silently skipped.
 
-MISSING FUNCTIONS (5 out of ~1000)
-  Five REL::Relocation<> sites are not captured:
+THIRD-PARTY DEPENDENCIES
+  CommonLibF4 has no PCH equivalent to CommonLibSSE's spdlog/binary_io chain;
+  the unity parse only needs Fallout.h to be parseable.  If parse errors occur,
+  add the relevant -isystem includes via VCPKG_ROOT or generated stubs.
 
-  BSPointerHandleManager::GetHandleEntries (BSPointerHandleManager.h line 30)
-    Type is 'REL::Relocation<Entry(*)[0x100000]>'.  The integer 0x100000 (array
-    bound in the template type argument) is found first by the AST literal
-    scanner, shadowing the real RELOCATION_ID(514478, 400622).  The token-stream
-    fallback is not attempted because get_int_literals already returned a value.
-    Root cause: get_int_literals does not skip INTEGER_LITERALs inside template
-    type arguments.
-
-  RTTI::from, RTTI::to (RE/RTTI.h lines 228-229)
-  NiObjectNET::rtti (RE/N/NiObjectNET.h line 67)
-  NiRTTI::to (RE/N/NiRTTI.h line 103)
-    All four live inside template functions where the REL::Relocation<> is
-    initialised with a static member of a template type parameter
-    (e.g. 'remove_cvpr_t<From>::RTTI', 'T::Ni_RTTI').  There is no integer
-    RELOCATION_ID present — the address depends entirely on which type the
-    template is instantiated with.  Unresolvable without template instantiation.
-
-STATIC METHOD DETECTION
-  'static' is inferred from the libclang AST when a CXX_METHOD is marked
-  is_static_method().  For src/.cpp definitions the static flag comes from the
-  enclosing CXX_METHOD cursor; if that cursor is not static (because the .cpp
-  definition omits the keyword and libclang cannot match it to the declaration),
-  the flag defaults to False.  The Skyrim.h header parse does correctly mark
-  statics, so header-derived symbols are unaffected.
-
-THIRD-PARTY DEPENDENCIES: binary_io, spdlog (RESOLVED)
-  'binary_io/file_stream.hpp' and 'spdlog/spdlog.h' are not part of CommonLibSSE
-  but are required by its PCH.  The script adds them via -isystem from vcpkg
-  ($VCPKG_ROOT/installed/x64-windows/include) or falls back to generated stubs
-  in _clang_stubs/.  Without either, a fatal parse error breaks template
-  instantiation for ~1300 structs (TESForm and all descendants get size=1).
-
-STRUCT FIELD SIZES — PDB cross-reference
-  PDB type info is loaded via DIA SDK (COM) or a manual TPI stream parser.
-  Two classes have a genuine size disagreement between libclang and the PDB
-  and are kept with libclang's layout (PDB data ignored for those types):
-    RE::AttackAnimationArrayMap  libclang=16  PDB=64
-    RE::bhkTelekinesisListener   libclang=8   PDB=16
-  If the PDB is absent, all struct sizes fall back to libclang's sizeof
-  estimate, which may be incorrect for types with compiler-specific padding
-  or #pragma pack.
+STRUCT FIELD SIZES
+  No F4 PDB is shipped — sizes fall back to libclang's sizeof estimate, which
+  may be incorrect for types with compiler-specific padding or #pragma pack.
 
 VTABLE SLOT COMPUTATION
   Vtable slot indices are computed from the libclang AST by counting virtual
@@ -84,11 +68,11 @@ TEMPLATE INSTANTIATIONS
   not expanded for every T in use — those fields appear with their template
   parameter types, not the concrete substituted types.
 
-AE OFFSET MAP COMPLETENESS
-  The AE offset map is built from the same Skyrim.h parse as the SE map.  If a
-  function only has an AE-side RELOCATION_ID (i.e. no SE counterpart), it is
-  captured; however the se_off field will be None and the symbol will not appear
-  in the SE output script.
+OG / VR ID COVERAGE
+  Most RTTI/VTABLE IDs in IDs_RTTI.h / IDs_VTABLE.h are above 1.6M, which means
+  they are absent from the OG (1.10.163) and VR (1.2.72) address libraries.
+  The OG and VR emit passes will skip those symbols silently — only the IDs
+  that exist in the target version's CSV/bin are written into that script.
 
 32-BIT PYTHON
   libclang.dll is 64-bit; the script will exit at startup on 32-bit Python
@@ -591,7 +575,7 @@ def load_pdb_types(pdb_path):
         return {}
     return _load_pdb_types_dia(pdb_path)
 
-# Third-party include directory for headers required by CommonLibSSE PCH
+# Third-party include directory for headers required by CommonLibF4
 # (binary_io, spdlog).  Without these, PCH.h triggers a fatal error that
 # aborts parsing and prevents libclang from instantiating templates — causing
 # ~1300 structs (TESForm and all descendants) to report size=1.
@@ -866,7 +850,7 @@ def _collect_types(tu):
                 return
 
             ns_path = _get_namespace_path(cursor)
-            category = '/CommonLibSSE/' + '/'.join(ns_path) if ns_path else '/CommonLibSSE'
+            category = '/CommonLibF4/' + '/'.join(ns_path) if ns_path else '/CommonLibF4'
 
             values = []
             for child in cursor.get_children():
@@ -911,7 +895,7 @@ def _collect_types(tu):
                 return
 
             ns_path = _get_namespace_path(cursor)
-            category = '/CommonLibSSE/' + '/'.join(ns_path) if ns_path else '/CommonLibSSE'
+            category = '/CommonLibF4/' + '/'.join(ns_path) if ns_path else '/CommonLibF4'
 
             # Collect fields
             fields = []
@@ -1038,12 +1022,12 @@ def _type_str_size(type_str):
 # ---------------------------------------------------------------------------
 
 GHIDRA_MERGED_HEADER = '''\
-# Ghidra import script: CommonLibSSE types + symbols
+# Ghidra import script: CommonLibF4 types + symbols
 # Generated by parse_commonlib_types.py
 # Run in Ghidra via Script Manager
 #
 # @category CommonLib
-# @description Import CommonLibSSE type definitions and symbol names
+# @description Import CommonLibF4 type definitions and symbol names
 
 from ghidra.program.model.symbol import SourceType
 from ghidra.app.cmd.disassemble import DisassembleCommand
@@ -1168,7 +1152,7 @@ def convert_sig_to_ghidra(sig, func_name):
 
     sig = ' '.join(sig.split())
 
-    # Strip any leading `typedef ...;` declarations. CommonLibSSE occasionally
+    # Strip any leading `typedef ...;` declarations. CommonLibF4 occasionally
     # embeds nested typedefs in extracted function-body signatures, which would
     # otherwise end up concatenated into the return-type token we emit to
     # Ghidra's C parser.
@@ -1398,7 +1382,7 @@ def _import_types():
         dt = dtm.addDataType(e, CONFLICT)
         created[name] = dt
         created[category + '/' + name] = dt
-        ns = category[len('/CommonLibSSE/'):].replace('/', '::')
+        ns = category[len('/CommonLibF4/'):].replace('/', '::')
         if ns:
             created[ns + '::' + name] = dt
     print('Created {} enums'.format(len(ENUMS)))
@@ -1440,7 +1424,7 @@ def _import_types():
         dt = dtm.addDataType(s, CONFLICT)
         created[name] = dt
         created[category + '/' + name] = dt
-        ns = category[len('/CommonLibSSE/'):].replace('/', '::')
+        ns = category[len('/CommonLibF4/'):].replace('/', '::')
         if ns:
             created[ns + '::' + name] = dt
     # Also register C-safe alias names for template structs (for CParserUtils resolution)
@@ -1553,8 +1537,8 @@ def _import_symbols():
                     elif ae_id:
                         comment_parts.append('REL::ID(' + str(ae_id) + ')')
                     src = s.get('src', '')
-                    if src == 'CommonLibSSE':
-                        comment_parts.append('Source: CommonLibSSE headers')
+                    if src == 'CommonLibF4':
+                        comment_parts.append('Source: CommonLibF4 headers')
                     elif src == 'skyrimae.rename':
                         comment_parts.append('Source: AE rename database (fallback)')
                     elif src == 'SkyrimSE.pdb':
@@ -1699,7 +1683,7 @@ def _import_vtable_names():
                     cu.setComment(0, (
                         'VTABLE ' + class_full_name + '::' + slot_name + '\\n' +
                         'Slot offset: +0x{:X}\\n'.format(slot_off) +
-                        'Source: CommonLibSSE vtable walk'
+                        'Source: CommonLibF4 vtable walk'
                     ))
                 if slot_ret is not None and slot_params is not None:
                     try:
@@ -1777,7 +1761,7 @@ def _import_vtable_names():
                         cu.setComment(0, (
                             'VTABLE ' + class_short + '::' + func_name + '\\n' +
                             'Slot offset: +0x{:X}\\n'.format((slot_idx - 1) * ptr_size) +
-                            'Source: CommonLibSSE vtable walk (unnamed)'
+                            'Source: CommonLibF4 vtable walk (unnamed)'
                         ))
                     unnamed_named += 1
                 except Exception:
@@ -1907,7 +1891,7 @@ def generate_script(enums, structs, vtable_structs, output_path, version, symbol
     lines.append('SYMBOLS = ' + symbols_json)
     lines.append('')
 
-    # Upgrade fallback symbols that match vtable slots: change source to CommonLibSSE
+    # Upgrade fallback symbols that match vtable slots: change source to CommonLibF4
     # and add signature so they display correctly even if vtable walk fails at runtime.
     _vtable_sigs = {}  # 'ClassName::MethodName' -> (ret, params)
     for vt in vtable_structs.values():
@@ -1922,10 +1906,10 @@ def generate_script(enums, structs, vtable_structs, output_path, version, symbol
         for s in _fb:
             sig_info = _vtable_sigs.get(s.get('n'))
             if sig_info:
-                s['src'] = 'CommonLibSSE'
+                s['src'] = 'CommonLibF4'
                 _upgraded += 1
         if _upgraded:
-            print('  Upgraded {} vtable-known fallback symbols to CommonLibSSE source'.format(_upgraded))
+            print('  Upgraded {} vtable-known fallback symbols to CommonLibF4 source'.format(_upgraded))
             fallback_symbols_json = _json_mod.dumps(_fb, separators=(',', ':'))
 
     # Fallback symbols (AE rename / SE PDB new entries) applied after vtable walk
@@ -2397,7 +2381,7 @@ def _flatten_structs(structs):
 
 
 def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
-    """Walk the CommonLibSSE AST to collect function symbols and RTTI/VTABLE labels.
+    """Walk the CommonLibF4 AST to collect function symbols and RTTI/VTABLE labels.
 
     For function symbols: finds VAR_DECL nodes whose type contains 'REL::Relocation<'.
     When the var is inside an inline function body, uses the enclosing function's name,
@@ -2813,17 +2797,17 @@ def _collect_relocations_from_tu(tu, addr_lib, is_ae, extra_offset_map=None):
     return func_syms, label_syms, offset_id_map, static_methods
 
 
-def _collect_src_relocations(src_dir, addr_lib, se_offset_map=None, ae_offset_map=None):
-    """Parse CommonLibSSE src/*.cpp via libclang and collect function symbols.
+def _collect_src_relocations(src_dir, addr_lib, id_map=None):
+    """Parse CommonLibF4 src/*.cpp via libclang and collect function symbols.
 
     Builds an in-memory unity file that #includes every src .cpp, parses it
-    via libclang for both SE and AE modes (same path as the Skyrim.h parse),
-    and returns merged func_syms with both se_off and ae_off where available.
+    via libclang once (F4 IDs are version-agnostic), and returns func_syms
+    each carrying a single REL::ID value to be resolved per-version at emit
+    time.
 
-    se_offset_map / ae_offset_map: Offset:: namespace ID maps already built from
-    the Skyrim.h parse.  Injected into the unity TU's offset lookup so that
-    Offset:: references in src/ files resolve correctly without needing to
-    re-parse the Offset namespace (which requires SKSE's PCH to compile).
+    id_map: ID:: namespace REL::ID map already built from the Fallout.h parse.
+    Injected into the unity TU's lookup so that ID:: references in src/ files
+    resolve correctly without needing to re-parse the ID namespace.
 
     Using libclang here instead of regex means the function names, return types,
     parameter types, and static/virtual qualifiers are all read directly from the
@@ -2835,14 +2819,14 @@ def _collect_src_relocations(src_dir, addr_lib, se_offset_map=None, ae_offset_ma
 
     # Build unity file content: #include every .cpp with its absolute path.
     # Forward slashes work on Windows under libclang/LLVM.
-    # RE/Skyrim.h must come first: it pulls in SKSE/Impl/PCH.h which provides
+    # RE/Fallout.h must come first: it pulls in F4SE/Impl/PCH.h which provides
     # <cstdint> and other standard types needed by REL/Version.h → REL/Module.h.
     # Without it, REL::Relocation<T> degrades to 'int' under libclang's error
-    # recovery, making VAR_DECL type checks fail.  After Skyrim.h is parsed once,
+    # recovery, making VAR_DECL type checks fail.  After Fallout.h is parsed once,
     # all subsequent #includes in the .cpp files hit header guards and are free.
     unity_lines = [
         '// libclang unity parse — auto-generated, not written to disk\n',
-        '#include "RE/Skyrim.h"\n',
+        '#include "RE/Fallout.h"\n',
     ]
     for p in cpp_files:
         unity_lines.append('#include "{}"\n'.format(p.replace('\\', '/')))
@@ -2906,10 +2890,11 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
     print('\n=== {} ==='.format(version.upper()))
 
     if not os.path.isfile(FALLOUT_H):
-        print('ERROR: Could not find Skyrim.h at', FALLOUT_H)
+        print('ERROR: Could not find Fallout.h at', FALLOUT_H)
+        print('       Run: git submodule update --init --recursive')
         sys.exit(1)
 
-    print('Parsing CommonLibSSE headers...')
+    print('Parsing CommonLibF4 headers...')
     idx = ci.Index.create()
     tu = idx.parse(FALLOUT_H, args=parse_args, options=PARSE_OPTIONS)
 
@@ -2940,7 +2925,7 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
 
     # Inject manually-defined extra types from extra_types.json
     extra = _load_extra_types()
-    category = '/CommonLibSSE/RE'
+    category = '/CommonLibF4/RE'
     for name, info in extra['typedefs'].items():
         if name not in enums and name not in structs:
             # Register as a 0-field struct sized to match the base type
@@ -3061,8 +3046,8 @@ def main():
         else:
             se_func_syms, se_label_syms, se_offset_map = fs, ls, off_map
 
-    # Parse src/ cpp files via libclang (unity build) for functions not in Skyrim.h
-    src_dir = os.path.join(SCRIPT_DIR, 'extern', 'CommonLibSSE', 'src')
+    # Parse src/ cpp files via libclang (unity build) for functions not in Fallout.h
+    src_dir = os.path.join(SCRIPT_DIR, 'extern', 'CommonLibF4', 'src')
     if os.path.isdir(src_dir):
         src_func_syms = _collect_src_relocations(
             src_dir, addr_lib, se_offset_map, ae_offset_map)
@@ -3121,14 +3106,14 @@ def main():
             sig = '{}({})'.format(fs['ret'], fs.get('params', ''))
             if fs.get('is_static'):
                 sig = 'static ' + sig
-        sym = {'n': full_name, 't': 'func', 'sig': sig, 'src': 'CommonLibSSE'}
+        sym = {'n': full_name, 't': 'func', 'sig': sig, 'src': 'CommonLibF4'}
         if fs['se_off']: sym['s'] = fs['se_off']; sym_seen_se.add(fs['se_off'])
         if fs['ae_off']: sym['a'] = fs['ae_off']; sym_seen_ae.add(fs['ae_off'])
         symbols.append(sym)
 
     # RTTI/VTABLE labels
     for lbl in label_by_name.values():
-        sym = {'n': lbl['name'], 't': 'label', 'sig': '', 'src': 'CommonLibSSE'}
+        sym = {'n': lbl['name'], 't': 'label', 'sig': '', 'src': 'CommonLibF4'}
         if lbl['se_off']: sym['s'] = lbl['se_off']; sym_seen_se.add(lbl['se_off'])
         if lbl['ae_off']: sym['a'] = lbl['ae_off']; sym_seen_ae.add(lbl['ae_off'])
         symbols.append(sym)
