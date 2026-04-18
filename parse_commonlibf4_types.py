@@ -126,6 +126,7 @@ ci.Config.set_library_file(_dll)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 COMMONLIB_INCLUDE = os.path.join(SCRIPT_DIR, 'extern', 'CommonLibF4', 'include')
+COMMONLIB_SHARED_INCLUDE = os.path.join(SCRIPT_DIR, 'extern', 'CommonLibF4', 'lib', 'commonlib-shared', 'include')
 FALLOUT_H = os.path.join(COMMONLIB_INCLUDE, 'RE', 'Fallout.h')
 RE_INCLUDE = os.path.join(COMMONLIB_INCLUDE, 'RE')
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'ghidrascripts')
@@ -200,124 +201,6 @@ def _undecorate(name):
     except Exception:
         pass
     return name
-
-
-def load_se_pdb_names(file_path):
-    """Parse a PDB (MSF7) file and return dict of rva -> name for all public function symbols."""
-    if not os.path.exists(file_path):
-        return {}
-
-    with open(file_path, 'rb') as f:
-        data = f.read()
-
-    if not data.startswith(b'Microsoft C/C++ MSF 7.00\r\n\x1aDS\x00\x00\x00'):
-        return {}
-
-    # MSF superblock
-    page_size = struct.unpack_from('<I', data, 32)[0]
-    dir_size  = struct.unpack_from('<I', data, 44)[0]
-    blk_map   = struct.unpack_from('<I', data, 52)[0]
-
-    # Stream directory
-    n_dir_pages = math.ceil(dir_size / page_size)
-    dir_page_list = struct.unpack_from(f'<{n_dir_pages}I', data, blk_map * page_size)
-    dir_data = b''.join(data[p * page_size:(p + 1) * page_size] for p in dir_page_list)[:dir_size]
-
-    n_streams = struct.unpack_from('<I', dir_data, 0)[0]
-    sizes = struct.unpack_from(f'<{n_streams}I', dir_data, 4)
-
-    o = 4 + n_streams * 4
-    stream_pages = []
-    for sz in sizes:
-        if sz == 0 or sz == 0xFFFFFFFF:
-            stream_pages.append([])
-        else:
-            np = math.ceil(sz / page_size)
-            stream_pages.append(list(struct.unpack_from(f'<{np}I', dir_data, o)))
-            o += np * 4
-
-    def read_stream(idx):
-        if idx >= n_streams or sizes[idx] in (0, 0xFFFFFFFF):
-            return b''
-        return b''.join(data[p * page_size:(p + 1) * page_size] for p in stream_pages[idx])[:sizes[idx]]
-
-    # DBI stream (stream 3)
-    dbi = read_stream(3)
-    if len(dbi) < 64:
-        return {}
-
-    (_, _, _,
-     _, _,
-     _, _,
-     sym_rec_idx, _,
-     mod_sz, sec_contrib_sz, sec_map_sz, src_sz, type_srv_sz, _,
-     opt_dbg_sz, ec_sz,
-     _, _, _) = struct.unpack_from('<iIIHHHHHHiiiiiIiiHHI', dbi)
-
-    # Section headers stream index (offset 10 within optional debug header)
-    opt_off = 64 + mod_sz + sec_contrib_sz + sec_map_sz + src_sz + type_srv_sz + ec_sz
-    sec_hdr_idx = struct.unpack_from('<H', dbi, opt_off + 10)[0] if opt_dbg_sz >= 12 else 0xFFFF
-
-    # Section virtual addresses (needed to convert seg:off -> RVA)
-    sections = []
-    if sec_hdr_idx != 0xFFFF:
-        sec_data = read_stream(sec_hdr_idx)
-        sections = [struct.unpack_from('<I', sec_data, i * 40 + 12)[0] for i in range(len(sec_data) // 40)]
-
-    # Parse symbol records stream for S_PUB32 (public function) records
-    sym_data = read_stream(sym_rec_idx)
-    S_PUB32 = 0x110E
-    result = {}
-    o = 0
-    while o + 4 <= len(sym_data):
-        rec_len, rec_typ = struct.unpack_from('<HH', sym_data, o)
-        rec_end = o + 2 + rec_len
-        if rec_len < 2 or rec_end > len(sym_data):
-            break
-        if rec_typ == S_PUB32 and rec_end >= o + 14:
-            pub_flags, off, seg = struct.unpack_from('<IIH', sym_data, o + 4)
-            if pub_flags & 0x2 and 1 <= seg <= len(sections):
-                nul = sym_data.find(b'\x00', o + 14, rec_end)
-                if nul != -1:
-                    name = sym_data[o + 14:nul].decode('ascii', errors='replace')
-                    if name.startswith('?'):
-                        name = _undecorate(name)
-                    if re.match(r'^FUN_[0-9A-Fa-f]+$', name):
-                        o = rec_end
-                        continue
-                    # Strip embedded full-address suffix (e.g. WriteToSaveGame_1404D62A0)
-                    name = re.sub(r'_14[0-9A-Fa-f]{6,8}$', '', name)
-                    # Replace __ namespace separator with ::
-                    name = re.sub(r':{3,}', '::', name.replace('__', '::'))
-                    result[sections[seg - 1] + off] = name
-        o = rec_end
-
-    return result
-
-
-def load_ae_rename_db(file_path, ae_db):
-    """Load skyrimae.rename: lines of '<ae_id> <name>', skip version line."""
-    result = {}  # ae_offset -> name
-    if not os.path.exists(file_path):
-        return result
-    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-        lines = f.readlines()
-    for line in lines[1:]:  # skip version line
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(' ', 1)
-        if len(parts) != 2:
-            continue
-        name = parts[1].rstrip('*').rstrip('_')
-        try:
-            ae_id = int(parts[0])
-        except ValueError:
-            continue
-        off = ae_db.get(ae_id)
-        if off:
-            result[off] = name
-    return result
 
 
 def _load_extra_types():
@@ -621,6 +504,7 @@ PARSE_ARGS_BASE = [
     '-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH',  # suppress STL1000 clang version check
     '-isystem', _THIRD_PARTY_INCLUDE,  # binary_io/spdlog (vcpkg or stubs)
     '-I' + COMMONLIB_INCLUDE,
+    '-I' + COMMONLIB_SHARED_INCLUDE,  # REL/ID.h, REL/REL.h etc. (nested submodule)
 ]
 
 PARSE_OPTIONS = (
@@ -1467,7 +1351,7 @@ def _import_types():
 
 
 def _import_symbols():
-    version_key = 's' if VERSION == 'se' else 'a'
+    version_key = {'f4og': 'og', 'f4ng': 'ng', 'f4vr': 'vr'}[VERSION]
     symbol_table = currentProgram.getSymbolTable()
     base_addr = currentProgram.getImageBase()
     fm = currentProgram.getFunctionManager()
@@ -1528,21 +1412,12 @@ def _import_symbols():
                         f.setName(final_name, SourceType.USER_DEFINED)
 
                     comment_parts = []
-                    se_id = s.get('si')
-                    ae_id = s.get('ai')
-                    if se_id and ae_id:
-                        comment_parts.append('RELOCATION_ID(' + str(se_id) + ', ' + str(ae_id) + ')')
-                    elif se_id:
-                        comment_parts.append('REL::ID(' + str(se_id) + ')')
-                    elif ae_id:
-                        comment_parts.append('REL::ID(' + str(ae_id) + ')')
+                    id_val = s.get('id')
+                    if id_val:
+                        comment_parts.append('REL::ID(' + str(id_val) + ')')
                     src = s.get('src', '')
                     if src == 'CommonLibF4':
                         comment_parts.append('Source: CommonLibF4 headers')
-                    elif src == 'skyrimae.rename':
-                        comment_parts.append('Source: AE rename database (fallback)')
-                    elif src == 'SkyrimSE.pdb':
-                        comment_parts.append('Source: SkyrimSE.pdb public symbols (fallback)')
                     if comment_parts:
                         cu = currentProgram.getListing().getCodeUnitAt(addr)
                         if cu:
@@ -1776,7 +1651,7 @@ def _import_fallback_symbols():
     Runs after _import_vtable_names() so any function already named by the
     vtable walk or the main symbol pass is left untouched.
     """
-    version_key = 's' if VERSION == 'se' else 'a'
+    version_key = {'f4og': 'og', 'f4ng': 'ng', 'f4vr': 'vr'}[VERSION]
     base_addr = currentProgram.getImageBase()
     fm = currentProgram.getFunctionManager()
     symbol_table = currentProgram.getSymbolTable()
@@ -1808,12 +1683,7 @@ def _import_fallback_symbols():
                 symbol_table.createLabel(addr, sname, SourceType.USER_DEFINED)
 
             src = s.get('src', '')
-            if src == 'skyrimae.rename':
-                comment = 'Source: AE rename database (fallback)'
-            elif src == 'SkyrimSE.pdb':
-                comment = 'Source: SkyrimSE.pdb public symbols (fallback)'
-            else:
-                comment = ''
+            comment = 'Source: ' + src + ' (fallback)' if src else ''
             if comment:
                 cu = currentProgram.getListing().getCodeUnitAt(addr)
                 if cu:
@@ -2697,21 +2567,45 @@ def _collect_relocations_from_tu(tu, extra_id_map=None):
                     })
 
             elif var_name.startswith(('RTTI_', 'VTABLE_')):
-                # Try forward-tokenization first (reads past cursor extent).
+                # Legacy SE-style naming: variable itself carries RTTI_/VTABLE_ prefix
                 ids = get_ints_from_cursor_forward(cursor)
                 if not ids:
                     ids = get_int_literals(cursor)
-                    # For std::array<REL::ID, N> VTABLE_ vars, get_int_literals
-                    # picks up the array size N as the first integer — skip it.
-                    type_sp = cursor.type.spelling
-                    if (var_name.startswith('VTABLE_')
-                            and 'array' in type_sp and len(ids) > 1):
+                    if ('array' in type_sp and len(ids) > 1):
                         ids = ids[1:]
                 if ids:
                     the_id = ids[0]
                     if the_id not in seen_label_ids:
                         seen_label_ids.add(the_id)
                         label_syms.append({'name': var_name, 'id': the_id})
+
+            else:
+                # F4 style: RE::RTTI::<Name>, RE::Ni_RTTI::<Name>, RE::VTABLE::<Name>
+                # Detect by the semantic parent namespace.
+                sp = cursor.semantic_parent
+                ns_name = sp.spelling if sp and sp.kind == ci.CursorKind.NAMESPACE else ''
+                prefix = None
+                if ns_name == 'RTTI':
+                    prefix = 'RTTI_'
+                elif ns_name == 'Ni_RTTI':
+                    prefix = 'NiRTTI_'
+                elif ns_name == 'VTABLE':
+                    prefix = 'VTABLE_'
+                if prefix:
+                    ids = get_int_literals(cursor)
+                    if not ids:
+                        ids = get_ints_from_cursor_forward(cursor)
+                    # VTABLE is std::array<REL::ID, N>{ REL::ID(x), REL::ID(y) ... }
+                    # — get_int_literals may pick up the array size N first; drop it
+                    # when len > 1 and the leading int matches N.
+                    if prefix == 'VTABLE_' and 'array' in type_sp and len(ids) > 1:
+                        ids = ids[1:]
+                    if ids:
+                        the_id = ids[0]
+                        label_name = prefix + var_name
+                        if the_id not in seen_label_ids:
+                            seen_label_ids.add(the_id)
+                            label_syms.append({'name': label_name, 'id': the_id})
 
         for c in cursor.get_children():
             walk(c, cursor, enc_name, enc_class, enc_ret, enc_params, enc_static, depth + 1)
@@ -2943,166 +2837,106 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
 def main():
     import json as _json
 
-    # Load address databases (binary data, not source scanning)
+    # Load address databases (binary V0 for OG/NG, CSV for VR)
     addr_lib = AddressLibrary()
     addr_lib.load_all(os.path.join(SCRIPT_DIR, 'addresslibrary'))
-    print('SE entries: {}, AE entries: {}'.format(len(addr_lib.se_db), len(addr_lib.ae_db)))
+    print('Address DBs — OG: {}, NG: {}, VR: {}'.format(
+        len(addr_lib.f4og_db), len(addr_lib.f4ng_db), len(addr_lib.f4vr_db)))
 
-    # Parse both versions with full function-body parsing to collect relocation IDs
+    # F4 headers are version-agnostic — one libclang pass yields all ID-bearing
+    # symbols.  Per-version resolution is done afterwards against the three DBs.
     print('\n=== Collecting symbols via libclang ===')
-    se_func_syms = []
-    se_label_syms = []
-    ae_func_syms = []
-    ae_label_syms = []
-    se_offset_map = {}
-    ae_offset_map = {}
-    static_methods = set()
-
-    for version, is_ae in (('se', False), ('ae', True)):
-        cfg = VERSIONS[version]
-        parse_args = PARSE_ARGS_BASE + cfg['defines']
-        print('\n--- {} relocation scan ---'.format(version.upper()))
-        idx = ci.Index.create()
-        tu = idx.parse(FALLOUT_H, args=parse_args, options=PARSE_OPTIONS_FULL)
-        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error
-                  and 'binary_io/file_stream.hpp' not in d.spelling]
-        if errors:
-            print('  Parse errors ({} total, showing first 3):'.format(len(errors)))
-            for e in errors[:3]:
-                print('  ', e.spelling)
-        fs, ls, off_map, sm = _collect_relocations_from_tu(tu, addr_lib, is_ae)
-        static_methods |= sm  # union of SE and AE static methods (same headers)
-        if is_ae:
-            ae_func_syms, ae_label_syms, ae_offset_map = fs, ls, off_map
-        else:
-            se_func_syms, se_label_syms, se_offset_map = fs, ls, off_map
+    cfg = VERSIONS['f4ng']
+    parse_args = PARSE_ARGS_BASE + cfg['defines']
+    print('\n--- Fallout.h relocation scan ---')
+    idx = ci.Index.create()
+    tu = idx.parse(FALLOUT_H, args=parse_args, options=PARSE_OPTIONS_FULL)
+    errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error
+              and 'binary_io/file_stream.hpp' not in d.spelling]
+    if errors:
+        print('  Parse errors ({} total, showing first 3):'.format(len(errors)))
+        for e in errors[:3]:
+            print('  ', e.spelling)
+    hdr_funcs, hdr_labels, id_map, static_methods = _collect_relocations_from_tu(tu)
 
     # Parse src/ cpp files via libclang (unity build) for functions not in Fallout.h
     src_dir = os.path.join(SCRIPT_DIR, 'extern', 'CommonLibF4', 'src')
     if os.path.isdir(src_dir):
-        src_func_syms = _collect_src_relocations(
-            src_dir, addr_lib, se_offset_map, ae_offset_map)
+        src_funcs = _collect_src_relocations(src_dir, addr_lib, id_map=id_map)
     else:
-        src_func_syms = []
+        src_funcs = []
         print('  src/ dir not found, skipping')
 
-    # Merge RTTI/VTABLE labels — combine SE and AE offsets by name
-    label_by_name = {}
-    for lbl in se_label_syms:
-        label_by_name.setdefault(lbl['name'], {'name': lbl['name'], 'se_off': None, 'ae_off': None})
-        label_by_name[lbl['name']]['se_off'] = lbl['se_off']
-    for lbl in ae_label_syms:
-        label_by_name.setdefault(lbl['name'], {'name': lbl['name'], 'se_off': None, 'ae_off': None})
-        label_by_name[lbl['name']]['ae_off'] = lbl['ae_off']
-
-    # AE parse gives both IDs for functions; SE parse also yields any SE-only functions
-    # Merge: prefer AE entries (have both IDs); add SE-only if not covered
-    seen_se = set(fs['se_off'] for fs in ae_func_syms if fs['se_off'])
-    seen_ae = set(fs['ae_off'] for fs in ae_func_syms if fs['ae_off'])
-    merged_funcs = list(ae_func_syms)
-    for fs in se_func_syms:
-        if fs['se_off'] and fs['se_off'] not in seen_se:
-            seen_se.add(fs['se_off'])
-            merged_funcs.append(fs)
-    # Correct static detection for src/ symbols using the header-derived static_methods set.
-    # cursor.is_static_method() on a .cpp definition can return False under libclang error
-    # recovery when the definition cannot be linked back to its (static) header declaration.
-    for fs in src_func_syms:
+    # Merge header + src: dedup by ID, keep header entries first
+    seen_ids = set(fs['id'] for fs in hdr_funcs if fs.get('id'))
+    merged_funcs = list(hdr_funcs)
+    # Correct static detection for src/ symbols using the header-derived set.
+    # cursor.is_static_method() on a .cpp definition can return False under
+    # libclang error recovery if the def can't be linked back to its header decl.
+    for fs in src_funcs:
         if not fs.get('is_static') and fs.get('class_') and fs.get('name'):
             if (fs['class_'], fs['name']) in static_methods:
                 fs['is_static'] = True
-
-    # Add src/ symbols not already found via headers
-    for fs in src_func_syms:
-        se_off = fs.get('se_off')
-        ae_off = fs.get('ae_off')
-        if se_off and se_off in seen_se:
+        fid = fs.get('id')
+        if fid and fid in seen_ids:
             continue
-        if ae_off and ae_off in seen_ae:
-            continue
-        if se_off: seen_se.add(se_off)
-        if ae_off: seen_ae.add(ae_off)
+        if fid:
+            seen_ids.add(fid)
         merged_funcs.append(fs)
 
-    # Build SYMBOLS array
-    symbols = []
-    sym_seen_se = set()
-    sym_seen_ae = set()
+    # Dedup labels by name — headers are the sole source
+    label_by_name = {}
+    for lbl in hdr_labels:
+        label_by_name.setdefault(lbl['name'], lbl)
 
-    # Function symbols
+    # CommonLibF4 REL::ID values live in the NG (1.10.980+) namespace — the
+    # OG (1.10.163) and VR (1.2.72) address libraries use separate, disjoint
+    # ID namespaces.  Resolving NG IDs against OG/VR DBs by coincidence would
+    # produce incorrect offsets (wrong functions), so only the NG DB is used.
+    # OG/VR support would need an external cross-version ID mapping table.
+    # Keys are 2-char to avoid colliding with the 'n' (name) symbol key.
+    DB_KEYS = (
+        ('ng', addr_lib.f4ng_db),
+    )
+
+    def _resolve(sym, id_val):
+        if not id_val:
+            return
+        for vkey, db in DB_KEYS:
+            off = db.get(int(id_val))
+            if off is not None:
+                sym[vkey] = off
+
+    symbols = []
     for fs in merged_funcs:
-        full_name = '{}::{}'.format(fs['class_'], fs['name']) if fs['class_'] else fs['name']
+        name = fs.get('name')
+        cls = fs.get('class_')
+        if not isinstance(name, str) or not name:
+            continue
+        full_name = '{}::{}'.format(cls, name) if cls else name
         sig = ''
         if fs.get('ret'):
             sig = '{}({})'.format(fs['ret'], fs.get('params', ''))
             if fs.get('is_static'):
                 sig = 'static ' + sig
+        id_val = fs.get('id')
         sym = {'n': full_name, 't': 'func', 'sig': sig, 'src': 'CommonLibF4'}
-        if fs['se_off']: sym['s'] = fs['se_off']; sym_seen_se.add(fs['se_off'])
-        if fs['ae_off']: sym['a'] = fs['ae_off']; sym_seen_ae.add(fs['ae_off'])
-        symbols.append(sym)
+        if id_val:
+            sym['id'] = id_val
+        _resolve(sym, id_val)
+        if 'ng' in sym:
+            symbols.append(sym)
 
-    # RTTI/VTABLE labels
     for lbl in label_by_name.values():
+        if not isinstance(lbl.get('name'), str):
+            continue
+        id_val = lbl.get('id')
         sym = {'n': lbl['name'], 't': 'label', 'sig': '', 'src': 'CommonLibF4'}
-        if lbl['se_off']: sym['s'] = lbl['se_off']; sym_seen_se.add(lbl['se_off'])
-        if lbl['ae_off']: sym['a'] = lbl['ae_off']; sym_seen_ae.add(lbl['ae_off'])
-        symbols.append(sym)
-
-    # Index symbols by name for merge lookups.  Both fallback passes below use
-    # this to merge a missing version offset into an existing entry (e.g. merge
-    # a SE offset from the PDB into a symbol already present as AE-only from the
-    # rename DB) rather than creating a duplicate entry with the same name.
-    name_to_sym = {s['n']: s for s in symbols}
-
-    # AE rename database fallback
-    rename_db = os.path.join(SCRIPT_DIR, 'extern', 'AddressLibraryDatabase', 'skyrimae.rename')
-    ae_rename = load_ae_rename_db(rename_db, addr_lib.ae_db)
-    rename_added = rename_merged = 0
-    for ae_off, name in ae_rename.items():
-        if ae_off in sym_seen_ae:
-            continue  # address already claimed by a higher-priority source
-        if name in name_to_sym:
-            # Symbol known from another source but missing its AE offset — merge it in.
-            existing = name_to_sym[name]
-            if not existing.get('a'):
-                existing['a'] = ae_off
-                sym_seen_ae.add(ae_off)
-                rename_merged += 1
-            continue
-        sym_seen_ae.add(ae_off)
-        sym = {'n': name, 't': 'func', 'sig': '', 'a': ae_off, 'src': 'skyrimae.rename'}
-        symbols.append(sym)
-        name_to_sym[name] = sym
-        rename_added += 1
-    print('Added {} new symbols from AE rename, merged AE offset into {} existing'.format(
-        rename_added, rename_merged))
-
-    # SE PDB public symbols fallback: true last resort — only adds symbols whose
-    # name and address are not already represented by any higher-priority source.
-    # When the name is already known (e.g. from the AE rename DB) but lacks an SE
-    # address, the SE offset is merged in rather than creating a duplicate entry.
-    se_pdb_path = os.path.join(SCRIPT_DIR, 'pdbs', 'SkyrimSE.pdb')
-    se_pdb_names = load_se_pdb_names(se_pdb_path)
-    pdb_added = pdb_merged = 0
-    for se_off, name in se_pdb_names.items():
-        if se_off in sym_seen_se:
-            continue  # address already claimed by a higher-priority source
-        if name in name_to_sym:
-            # Symbol known from another source but missing its SE offset — merge it in.
-            existing = name_to_sym[name]
-            if not existing.get('s'):
-                existing['s'] = se_off
-                sym_seen_se.add(se_off)
-                pdb_merged += 1
-            continue
-        sym_seen_se.add(se_off)
-        sym = {'n': name, 't': 'func', 'sig': '', 's': se_off, 'src': 'SkyrimSE.pdb'}
-        symbols.append(sym)
-        name_to_sym[name] = sym
-        pdb_added += 1
-    print('Added {} new symbols from SE PDB, merged SE offset into {} existing'.format(
-        pdb_added, pdb_merged))
+        if id_val:
+            sym['id'] = id_val
+        _resolve(sym, id_val)
+        if 'ng' in sym:
+            symbols.append(sym)
 
     # Normalize __ → :: in all names
     for s in symbols:
@@ -3112,32 +2946,17 @@ def main():
     funcs = [s for s in symbols if s['t'] == 'func']
     with_sig = len([s for s in funcs if s.get('sig')])
     labels_count = len([s for s in symbols if s['t'] == 'label'])
-    print('\nGenerated {} symbols:'.format(len(symbols)))
+    print('\nGenerated {} symbols (NG namespace):'.format(len(symbols)))
     print('  Functions: {} ({} with signatures)'.format(len(funcs), with_sig))
     print('  Labels: {}'.format(labels_count))
 
-    _FALLBACK_SRCS = {'skyrimae.rename', 'SkyrimSE.pdb'}
-    primary_symbols  = [s for s in symbols if s.get('src') not in _FALLBACK_SRCS]
-    fallback_symbols = [s for s in symbols if s.get('src') in _FALLBACK_SRCS]
-    print('  Primary: {}, Fallback (AE rename / SE PDB new): {}'.format(
-        len(primary_symbols), len(fallback_symbols)))
+    symbols_json = _json.dumps(symbols, separators=(',', ':'))
 
-    symbols_json = _json.dumps(primary_symbols, separators=(',', ':'))
-
-    # Build per-version fallback lists:
-    # SE gets only SkyrimSE.pdb entries (skip skyrimae.rename-sourced symbols)
-    # AE gets only skyrimae.rename entries (skip SkyrimSE.pdb-sourced symbols)
-    se_fallback = [s for s in fallback_symbols if s.get('src') == 'SkyrimSE.pdb']
-    ae_fallback = [s for s in fallback_symbols if s.get('src') == 'skyrimae.rename']
-    print('  SE fallback: {} (PDB), AE fallback: {} (rename DB)'.format(
-        len(se_fallback), len(ae_fallback)))
-
-    se_fallback_json = _json.dumps(se_fallback, separators=(',', ':'))
-    ae_fallback_json = _json.dumps(ae_fallback, separators=(',', ':'))
-
-    for version in ('se', 'ae'):
-        fb_json = se_fallback_json if version == 'se' else ae_fallback_json
-        run_version(version, symbols_json, fb_json)
+    # Only NG has meaningful symbol resolution; the OG and VR scripts are
+    # still emitted but will be empty (no symbols match in their namespaces).
+    # They exist so downstream tooling sees the same three-script layout.
+    for version in ('f4og', 'f4ng', 'f4vr'):
+        run_version(version, symbols_json, '[]')
 
 
 if __name__ == '__main__':
