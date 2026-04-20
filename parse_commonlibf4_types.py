@@ -134,6 +134,22 @@ RE_INCLUDE = os.path.join(COMMONLIB_INCLUDE, 'RE')
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'ghidrascripts')
 EXTRA_TYPES_JSON = os.path.join(SCRIPT_DIR, 'extra_types.json')
 
+# Optional: directory holding extra cross-version fallback data.
+# Defaults to the MasterModTemplate Shared tree; override with F4_SHARED_ANALYSIS.
+# If missing, fallback symbols are simply skipped.
+SHARED_ANALYSIS_DIR = os.environ.get(
+    'F4_SHARED_ANALYSIS',
+    r'C:\Development\MasterModTemplate\Shared\GhidraAnalysis',
+)
+# Parsing the 28MB+10MB F4/F4VR public PDB dumps adds ~175k OG + ~50k VR
+# fallback entries.  This inflates each generated script to ~25MB and the
+# Ghidra apply pass takes several minutes, but it's the only path to real
+# symbol coverage for F4 OG (disjoint ID namespace from CommonLibF4).
+# Set F4_INCLUDE_PDB=0 to disable.
+LOAD_PDB_FALLBACK_SYMBOLS = os.environ.get('F4_INCLUDE_PDB', '1') == '1'
+IMAGE_BASE = 0x140000000
+PE_TEXT_RVA = 0x1000  # seg1 offset → RVA = seg1_off + 0x1000
+
 
 # ---------------------------------------------------------------------------
 # Address library / PDB / rename-DB utilities (inlined from extract_signatures)
@@ -1046,6 +1062,31 @@ def convert_sig_to_ghidra(sig, func_name):
 
     sig = ' '.join(sig.split())
 
+    # Normalize MSVC-style stdint aliases that survive from PDB/database sources.
+    # e.g. 'unsigned __int64' → 'ulonglong'; single-token 'unsigned___int64' →
+    # 'ulonglong' (triple-underscore occurs when a whitespace-to-underscore pass
+    # upstream collapsed 'unsigned __int64').
+    sig = re.sub(r'\\bunsigned\\s+__int64\\b|\\bunsigned___int64\\b', 'ulonglong', sig)
+    sig = re.sub(r'\\bsigned\\s+__int64\\b|\\bsigned___int64\\b', 'longlong', sig)
+    sig = re.sub(r'\\b__int64\\b', 'longlong', sig)
+    sig = re.sub(r'\\bunsigned\\s+__int32\\b|\\bunsigned___int32\\b', 'uint', sig)
+    sig = re.sub(r'\\b__int32\\b', 'int', sig)
+    # stdint aliases — Ghidra's CParserUtils does NOT accept these as built-ins,
+    # so map them to its primitive names up-front.
+    sig = re.sub(r'\\bint8_t\\b',   'char',      sig)
+    sig = re.sub(r'\\bint16_t\\b',  'short',     sig)
+    sig = re.sub(r'\\bint32_t\\b',  'int',       sig)
+    sig = re.sub(r'\\bint64_t\\b',  'longlong',  sig)
+    sig = re.sub(r'\\buint8_t\\b',  'uchar',     sig)
+    sig = re.sub(r'\\buint16_t\\b', 'ushort',    sig)
+    sig = re.sub(r'\\buint32_t\\b', 'uint',      sig)
+    sig = re.sub(r'\\buint64_t\\b', 'ulonglong', sig)
+    sig = re.sub(r'\\bsize_t\\b',   'ulonglong', sig)
+    sig = re.sub(r'\\bssize_t\\b',  'longlong',  sig)
+    sig = re.sub(r'\\bptrdiff_t\\b','longlong',  sig)
+    sig = re.sub(r'\\bintptr_t\\b', 'longlong',  sig)
+    sig = re.sub(r'\\buintptr_t\\b','ulonglong', sig)
+
     # Strip any leading `typedef ...;` declarations. CommonLibF4 occasionally
     # embeds nested typedefs in extracted function-body signatures, which would
     # otherwise end up concatenated into the return-type token we emit to
@@ -1167,8 +1208,15 @@ def convert_sig_to_ghidra(sig, func_name):
             p = simplify_type(p)
             if not p: continue
             tokens = p.split()
-            if len(tokens) == 2 and tokens[0] == 'void' and '*' not in tokens[1]:
+            # Bare 'void' or 'void name' as a parameter type is invalid C — a
+            # function parameter cannot have type void (only 'void' as the sole
+            # parameter list means no params).  Promote to 'void *'.
+            if tokens == ['void']:
+                p = 'void *'
+                tokens = ['void', '*']
+            elif len(tokens) == 2 and tokens[0] == 'void' and '*' not in tokens[1]:
                 p = 'void * ' + tokens[1]
+                tokens = p.split()
             if tokens:
                 last = tokens[-1].rstrip('*')
                 if last in ('int','uint','float','double','bool','void','char',
@@ -1180,9 +1228,21 @@ def convert_sig_to_ghidra(sig, func_name):
 
     simple_name = func_name.split('::')[-1] if '::' in func_name else func_name
 
+    # Destructors (~Name) are not valid C identifiers — skip sig emission.
+    # The rename still lands; we just don't try to apply a typed signature.
+    if simple_name.startswith('~'):
+        return None
+
+    _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+    if not _IDENT_RE.match(simple_name):
+        return None
+
     if '::' in func_name and not is_static:
         class_name = func_name.rsplit('::', 1)[0]
         class_name = class_name.split('::')[-1] if '::' in class_name else class_name
+        # Reject non-identifier class names (e.g. MSVC's `anonymous_namespace').
+        if not _IDENT_RE.match(class_name):
+            return None
         this_param = class_name + ' * this'
         if ghidra_params == 'void':
             ghidra_params = this_param
@@ -1197,7 +1257,43 @@ _SAFE_TYPES = {
     'uchar', 'ushort', 'uint', 'ulong', 'longlong', 'ulonglong',
     'undefined', 'undefined1', 'undefined2', 'undefined4', 'undefined8',
     'byte', 'word', 'dword', 'qword', 'pointer', 'unsigned', 'signed',
+    # C qualifiers — appear in proto but don't add type requirements
+    'const', 'volatile', 'static', 'register', 'extern',
+    'wchar_t',
 }
+
+# Populated once at runtime from the DTM (after type-creation pass).  Used by
+# _proto_parseable to decide whether a sig can skip the strict-parse attempt
+# and go straight to sanitize_unknown_types — avoiding first-try parse errors
+# that Ghidra logs to its batch error dialog even when we catch the exception.
+_KNOWN_TYPES = set(_SAFE_TYPES)
+
+def _proto_parseable(proto):
+    """Return True if all base type tokens in proto are in _KNOWN_TYPES."""
+    m = re.match(r'(.*?)\\s+(\\w+)\\s*\\((.*)\\)$', proto)
+    if not m:
+        return False
+    ret, _, params = m.group(1), m.group(2), m.group(3)
+
+    def _base(t):
+        t = t.strip()
+        if not t:
+            return None
+        parts = [p for p in re.split(r'[\\s*&]+', t) if p]
+        if not parts:
+            return None
+        return parts[0]
+
+    rb = _base(ret)
+    if rb and rb not in _KNOWN_TYPES:
+        return False
+    if params.strip() in ('', 'void'):
+        return True
+    for p in params.split(','):
+        b = _base(p)
+        if b and b not in _KNOWN_TYPES:
+            return False
+    return True
 
 def sanitize_unknown_types(proto):
     """Replace unknown types with void* for Ghidra parse fallback."""
@@ -1207,8 +1303,14 @@ def sanitize_unknown_types(proto):
 
     def sanitize_token(t):
         t = t.strip()
-        if not t or t == 'void': return t
+        if not t: return t
         parts = t.split()
+        # Bare 'void' (or 'void <name>' without a '*') as a param type is
+        # invalid C.  Promote to 'void *' so Ghidra's C parser accepts it.
+        if parts[0] == 'void' and '*' not in t:
+            if len(parts) > 1 and parts[-1].isidentifier() and parts[-1] != 'void':
+                return 'void * ' + parts[-1]
+            return 'void *'
         base = parts[0].rstrip('*')
         if base.lower() in _SAFE_TYPES: return t
         is_ptr = '*' in t
@@ -1366,6 +1468,23 @@ def _import_symbols():
     base_addr = currentProgram.getImageBase()
     fm = currentProgram.getFunctionManager()
 
+    # Populate _KNOWN_TYPES from the just-created DTM entries so preflight
+    # can skip strict-parse for any sig referencing an unregistered type.
+    # Excludes template C-aliases (e.g. Scaleform_Ptr_Scaleform_GFx_...) —
+    # those are Python-side only lookup aids; the DTM stores the struct under
+    # its `::<>` display name, which CParserUtils cannot resolve from the alias.
+    _c_alias_only = set()
+    for _orig, _display in TEMPLATE_TYPE_MAP.items():
+        _alias = TEMPLATE_C_ALIAS_MAP.get(_orig, '')
+        if _alias and _alias != _display:
+            _c_alias_only.add(_alias)
+    for _k in created.keys():
+        if '/' in _k or '::' in _k:
+            continue
+        if _k in _c_alias_only:
+            continue
+        _KNOWN_TYPES.add(_k)
+
     print('Target version: ' + VERSION.upper())
     print('Applying ' + str(len(SYMBOLS)) + ' symbols...')
 
@@ -1437,23 +1556,27 @@ def _import_symbols():
                         proto = convert_sig_to_ghidra(s['sig'], final_name)
                         if proto:
                             applied = False
-                            try:
-                                func_def = CParserUtils.parseSignature(None, currentProgram, proto, True)
-                                if func_def:
-                                    cmd = ApplyFunctionSignatureCmd(addr, func_def, SourceType.USER_DEFINED, True, False)
-                                    cmd.applyTo(currentProgram)
-                                    applied = True
-                            except: pass
+                            # Preflight: only attempt strict parse if every base
+                            # type token is known to the DTM.  This avoids a
+                            # failed first-attempt parse that Ghidra logs to its
+                            # batch error dialog even when we catch the exception.
+                            if _proto_parseable(proto):
+                                try:
+                                    func_def = CParserUtils.parseSignature(None, currentProgram, proto, True)
+                                    if func_def:
+                                        cmd = ApplyFunctionSignatureCmd(addr, func_def, SourceType.USER_DEFINED, True, False)
+                                        cmd.applyTo(currentProgram)
+                                        applied = True
+                                except: pass
                             if not applied:
                                 proto_safe = sanitize_unknown_types(proto)
-                                if proto_safe != proto:
-                                    try:
-                                        func_def = CParserUtils.parseSignature(None, currentProgram, proto_safe, True)
-                                        if func_def:
-                                            cmd = ApplyFunctionSignatureCmd(addr, func_def, SourceType.USER_DEFINED, True, False)
-                                            cmd.applyTo(currentProgram)
-                                            applied = True
-                                    except: pass
+                                try:
+                                    func_def = CParserUtils.parseSignature(None, currentProgram, proto_safe, True)
+                                    if func_def:
+                                        cmd = ApplyFunctionSignatureCmd(addr, func_def, SourceType.USER_DEFINED, True, False)
+                                        cmd.applyTo(currentProgram)
+                                        applied = True
+                                except: pass
                             if applied:
                                 count_sig += 1
                             else:
@@ -2844,6 +2967,419 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
     print('Output: {} ({} enums, {} structs)'.format(output_path, n_enums, n_structs))
 
 
+# ---------------------------------------------------------------------------
+# Fallback symbol loaders (non-CommonLibF4 sources)
+# ---------------------------------------------------------------------------
+
+_FALLBACK_NAME_SKIP_PREFIXES = (
+    'FUN_', 'DAT_', 'LAB_', 'PTR_', 'UNK_', 's_', 'u_',
+    '_lambda_', '_unnamed_', '$',
+)
+
+
+def _demangle_rtti(raw):
+    """MSVC RTTI type descriptor string → Ghidra-safe RTTI_<name> label.
+    Handles plain classes (reverses @-nested tokens) and best-effort templates."""
+    s = raw
+    if s.startswith('.?A') and len(s) > 4:
+        s = s[4:]  # strip .?AU / .?AV / .?AT / .?AW
+    while s.endswith('@@'):
+        s = s[:-2]
+    if s.startswith('?$'):
+        # Template instantiation — MSVC mangling is complex.  Preserve
+        # the raw form minus structural markers for uniqueness.
+        s = re.sub(r'[^A-Za-z0-9_]', '_', s[2:]).strip('_')
+    elif '@' in s:
+        tokens = [t for t in s.split('@') if t]
+        s = '::'.join(reversed(tokens))
+    s = re.sub(r'[^A-Za-z0-9_:<>]', '_', s).rstrip('_')
+    return 'RTTI_' + s if s else None
+
+
+def _load_og_to_vr_map(path):
+    """fallout4_og_to_vr.csv → dict og_rva → vr_rva."""
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    import csv as _csv
+    with open(path, 'r', encoding='utf-8') as fh:
+        r = _csv.DictReader(fh)
+        for row in r:
+            try:
+                out[int(row['og_rva'], 16)] = int(row['vr_rva'], 16)
+            except (ValueError, KeyError, TypeError):
+                continue
+    return out
+
+
+def _load_og_to_ae_rtti(path):
+    """fallout4_og_to_ae_rtti.csv → list of {n, og, ae} RTTI label entries."""
+    out = []
+    if not os.path.isfile(path):
+        return out
+    import csv as _csv
+    with open(path, 'r', encoding='utf-8') as fh:
+        r = _csv.DictReader(fh)
+        for row in r:
+            try:
+                og = int(row['og_rtti_string_address'], 16) - IMAGE_BASE
+                ae = int(row['ae_rtti_string_address'], 16) - IMAGE_BASE
+            except (ValueError, KeyError, TypeError):
+                continue
+            mangled = row.get('mangled', '')
+            name = _demangle_rtti(mangled)
+            if not name:
+                continue
+            out.append({'n': name, 'og': og, 'ae': ae, 'src': 'RTTI_CrossVer'})
+    return out
+
+
+def _load_rtti_all_versions(path):
+    """fallout4_rtti_all_versions.csv → RTTI labels with up to 4 version offsets.
+
+    Produced by tools/rtti_extend.py (byte-string search for mangled names in
+    each binary).  Preferred over og_to_ae_rtti.csv when present.
+    """
+    out = []
+    if not os.path.isfile(path):
+        return out
+    import csv as _csv
+    with open(path, 'r', encoding='utf-8') as fh:
+        r = _csv.DictReader(fh)
+        for row in r:
+            mangled = row.get('mangled', '')
+            name = _demangle_rtti(mangled)
+            if not name:
+                continue
+            entry = {'n': name, 'src': 'RTTI_AllVer'}
+            for vkey, col in (('og', 'og_rtti_va'), ('ng', 'ng_rtti_va'),
+                              ('ae', 'ae_rtti_va'), ('vr', 'vr_rtti_va')):
+                val = (row.get(col) or '').strip()
+                if not val:
+                    continue
+                try:
+                    entry[vkey] = int(val, 16) - IMAGE_BASE
+                except ValueError:
+                    continue
+            if any(k in entry for k in ('og', 'ng', 'ae', 'vr')):
+                out.append(entry)
+    return out
+
+
+def _load_bytesig_map(path):
+    """fallout4_bytesig_map.csv → symbols with ported version offsets.
+
+    Produced by tools/run_bytesig_port.py (byte-signature matching across
+    binaries).  Columns: name,og,ng,ae,vr (each a hex RVA or empty).
+    Emitted as primary label entries — signatures aren't preserved through
+    the port, so the generator treats them as names-only.
+    """
+    out = []
+    if not os.path.isfile(path):
+        return out
+    import csv as _csv
+    with open(path, 'r', encoding='utf-8', newline='') as fh:
+        r = _csv.DictReader(fh)
+        for row in r:
+            name = (row.get('name') or '').strip()
+            if not name:
+                continue
+            entry = {'n': name, 't': 'label', 'sig': '', 'src': 'ByteSig_Port'}
+            for k in ('og', 'ng', 'ae', 'vr'):
+                val = (row.get(k) or '').strip()
+                if not val:
+                    continue
+                try:
+                    entry[k] = int(val, 16)
+                except ValueError:
+                    continue
+            if sum(1 for k in ('og', 'ng', 'ae', 'vr') if k in entry) >= 2:
+                out.append(entry)
+    return out
+
+
+_FO4DB_NAME_SKIP_PATTERNS = re.compile(
+    r'^(DAT|FUN|LAB|UNK|PTR|s|u|AutoRegister|_unnamed|_lambda)_'
+)
+
+
+def _load_fo4_database(path, min_status=3):
+    """fo4_database.csv → primary typed symbols with OG+VR coverage.
+
+    Row shape: id,fo4,vr,status,name
+      fo4 / vr = absolute VAs; status = quality (2 low, 3 med, 4 high);
+      name = 'Namespace::Method(T1,T2)' with optional quoting around commas.
+
+    Status < min_status and autogenerated names (DAT_*, FUN_*, AutoRegister_*,
+    etc.) are dropped.  Remaining rows emit as typed functions with a
+    CParserUtils-parseable signature of form 'undefined Name(args)'.
+    """
+    out = []
+    if not os.path.isfile(path):
+        return out
+    import csv as _csv
+    with open(path, 'r', encoding='utf-8', newline='') as fh:
+        r = _csv.DictReader(fh)
+        for row in r:
+            try:
+                status = int(row['status'])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if status < min_status:
+                continue
+            raw = (row.get('name') or '').strip()
+            if not raw:
+                continue
+            paren = raw.find('(')
+            bare = raw[:paren] if paren != -1 else raw
+            bare = bare.strip()
+            if not bare or _FO4DB_NAME_SKIP_PATTERNS.match(bare):
+                continue
+            if bare.startswith('?') or '$' in bare:
+                continue
+            sig = ''
+            if paren != -1:
+                params = raw[paren + 1:]
+                if params.endswith(')'):
+                    params = params[:-1]
+                sig = 'undefined {}({})'.format(bare, params)
+                entry = {'n': bare, 't': 'func', 'sig': sig, 'src': 'FO4_Database'}
+            else:
+                # No parens → data/label, not a function (vtable, global, string).
+                entry = {'n': bare, 't': 'label', 'src': 'FO4_Database'}
+            fo4_s = (row.get('fo4') or '').strip()
+            vr_s = (row.get('vr') or '').strip()
+            if fo4_s:
+                try:
+                    entry['og'] = int(fo4_s, 16) - IMAGE_BASE
+                except ValueError:
+                    pass
+            if vr_s:
+                try:
+                    entry['vr'] = int(vr_s, 16) - IMAGE_BASE
+                except ValueError:
+                    pass
+            if 'og' in entry or 'vr' in entry:
+                out.append(entry)
+    return out
+
+
+_HIGGS_TAG_RE = re.compile(r'\s*\[(HIGGS|Daytripper|F4SE|PLANCK)\]\s*$', re.IGNORECASE)
+
+
+def _load_new_address_contributions(path):
+    """new_address_contributions_resolved.csv → label-only OG+VR entries.
+
+    Row shape: id,vr,name,vr_func_start,vr_func_name,vr_offset,classification,
+               og_func_rva,og_addr,og_id_hint,method,notes
+
+    Names carry '[HIGGS]' / '[Daytripper]' tags — strip them.  og_addr may be a
+    sum '0x14011d410+0x3f0' (hook_site inside a function); parse both halves.
+    """
+    out = []
+    if not os.path.isfile(path):
+        return out
+    import csv as _csv
+    with open(path, 'r', encoding='utf-8', newline='') as fh:
+        r = _csv.DictReader(fh)
+        for row in r:
+            raw = (row.get('name') or '').strip()
+            if not raw:
+                continue
+            name = _HIGGS_TAG_RE.sub('', raw).strip()
+            if not name or _FO4DB_NAME_SKIP_PATTERNS.match(name):
+                continue
+            entry = {'n': name, 't': 'label', 'sig': '', 'src': 'HIGGS_Contribs'}
+            vr_s = (row.get('vr') or '').strip()
+            if vr_s:
+                try:
+                    entry['vr'] = int(vr_s, 16) - IMAGE_BASE
+                except ValueError:
+                    pass
+            og_s = (row.get('og_addr') or '').strip()
+            if og_s:
+                parts = [p.strip() for p in og_s.split('+') if p.strip()]
+                try:
+                    total = sum(int(p, 16) for p in parts)
+                    entry['og'] = total - IMAGE_BASE
+                except ValueError:
+                    pass
+            if 'og' in entry or 'vr' in entry:
+                out.append(entry)
+    return out
+
+def _clean_fallback_name(raw):
+    """Strip '(args)' suffix; reject obviously useless names."""
+    if not raw:
+        return None
+    # Drop C-style parameter list — Ghidra symbol names can't contain '('.
+    paren = raw.find('(')
+    name = raw[:paren] if paren != -1 else raw
+    name = name.strip()
+    if not name:
+        return None
+    if any(name.startswith(p) for p in _FALLBACK_NAME_SKIP_PREFIXES):
+        return None
+    # Drop mangled leftovers and helper-func tokens.
+    if '::_helper_func_' in name or name.startswith('?'):
+        return None
+    # Ghidra is OK with '::' but not whitespace or angle brackets in raw labels.
+    # We allow templates for richer names; the importer tolerates them.
+    return name
+
+
+def _load_f4ng_named_functions(path):
+    """F4NG_Exports/f4ng_named_functions.csv → [{n, ng, src}]"""
+    out = []
+    if not os.path.isfile(path):
+        return out
+    with open(path, 'r', encoding='utf-8') as fh:
+        next(fh, None)  # header
+        for line in fh:
+            parts = line.rstrip('\n').split(',', 3)
+            if len(parts) < 3:
+                continue
+            addr_s, fname, ns = parts[0], parts[1], parts[2]
+            if not addr_s.startswith('0x14'):
+                continue
+            try:
+                abs_va = int(addr_s, 16)
+            except ValueError:
+                continue
+            full = '{}::{}'.format(ns, fname) if ns and ns != fname else fname
+            cleaned = _clean_fallback_name(full)
+            if not cleaned:
+                continue
+            out.append({'n': cleaned, 'ng': abs_va - IMAGE_BASE, 'src': 'F4NG_Exports'})
+    return out
+
+
+def _load_f4se_known_offsets(path):
+    """F4VR_Exports/f4se_known_offsets.txt → [{n, vr, src}]"""
+    out = []
+    if not os.path.isfile(path):
+        return out
+    with open(path, 'r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('|')
+            if len(parts) < 2:
+                continue
+            try:
+                rva = int(parts[0], 16)
+            except ValueError:
+                continue
+            cleaned = _clean_fallback_name(parts[1])
+            if not cleaned:
+                continue
+            out.append({'n': cleaned, 'vr': rva, 'src': 'F4SE/PLANCK'})
+    return out
+
+
+def _load_pdb_pub_functions(path, version_key, src_label):
+    """f4*_pdb_pub_functions.txt → [{n, <version_key>, src}]
+    Format: segN:0xOFFSET|name.  Only seg1 (.text) is used: RVA = offset + PE_TEXT_RVA.
+    """
+    out = []
+    if not os.path.isfile(path):
+        return out
+    with open(path, 'r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.rstrip('\n')
+            if not line.startswith('seg1:'):
+                continue
+            bar = line.find('|')
+            if bar == -1:
+                continue
+            off_s = line[5:bar]
+            name = line[bar + 1:]
+            try:
+                off = int(off_s, 16)
+            except ValueError:
+                continue
+            cleaned = _clean_fallback_name(name)
+            if not cleaned:
+                continue
+            out.append({'n': cleaned, version_key: off + PE_TEXT_RVA, 'src': src_label})
+    return out
+
+
+def load_fallback_symbols():
+    """Collect per-version fallback symbols from the Shared analysis tree.
+    Returns a deduped list of dicts shaped like existing SYMBOLS entries:
+        {'n': name, 'src': label, ['og'|'ng'|'ae'|'vr']: rva_int}
+    """
+    if not os.path.isdir(SHARED_ANALYSIS_DIR):
+        print('Shared analysis dir not found at {}, skipping fallbacks.'.format(SHARED_ANALYSIS_DIR))
+        return []
+
+    collected = []
+    # F4NG: curated named functions (small)
+    p = os.path.join(SHARED_ANALYSIS_DIR, 'F4NG_Exports', 'f4ng_named_functions.csv')
+    ng_fns = _load_f4ng_named_functions(p)
+    print('  F4NG named functions: {}'.format(len(ng_fns)))
+    collected.extend(ng_fns)
+
+    # F4VR: F4SE/Planck hand-curated offsets (small)
+    p = os.path.join(SHARED_ANALYSIS_DIR, 'F4VR_Exports', 'f4se_known_offsets.txt')
+    vr_f4se = _load_f4se_known_offsets(p)
+    print('  F4SE/PLANCK VR offsets: {}'.format(len(vr_f4se)))
+    collected.extend(vr_f4se)
+
+    if LOAD_PDB_FALLBACK_SYMBOLS:
+        p = os.path.join(SHARED_ANALYSIS_DIR, 'F4VR_Exports', 'f4_pdb_pub_functions.txt')
+        og_pdb = _load_pdb_pub_functions(p, 'og', 'F4OG_PDB')
+        print('  F4 OG PDB public functions: {}'.format(len(og_pdb)))
+        collected.extend(og_pdb)
+        p = os.path.join(SHARED_ANALYSIS_DIR, 'F4VR_Exports', 'f4vr_pdb_pub_functions.txt')
+        vr_pdb = _load_pdb_pub_functions(p, 'vr', 'F4VR_PDB')
+        print('  F4VR PDB public functions: {}'.format(len(vr_pdb)))
+        collected.extend(vr_pdb)
+
+    # Cross-version RTTI — prefer 4-version CSV (tools/rtti_extend.py) over 2-version.
+    p_all = os.path.join(SHARED_ANALYSIS_DIR, 'CrossVersionMaps', 'fallout4_rtti_all_versions.csv')
+    rtti_all = _load_rtti_all_versions(p_all)
+    if rtti_all:
+        print('  Cross-version RTTI (OG+NG+AE+VR): {}'.format(len(rtti_all)))
+        collected.extend(rtti_all)
+    else:
+        p = os.path.join(SHARED_ANALYSIS_DIR, 'CrossVersionMaps', 'fallout4_og_to_ae_rtti.csv')
+        rtti = _load_og_to_ae_rtti(p)
+        print('  Cross-version RTTI (OG+AE, legacy): {}'.format(len(rtti)))
+        collected.extend(rtti)
+
+    # OG → VR chain: any fallback with og set picks up vr if a mapping exists.
+    p = os.path.join(SHARED_ANALYSIS_DIR, 'CrossVersionMaps', 'fallout4_og_to_vr.csv')
+    og_to_vr = _load_og_to_vr_map(p)
+    if og_to_vr:
+        ported = 0
+        for s in collected:
+            if 'og' in s and 'vr' not in s:
+                vr = og_to_vr.get(s['og'])
+                if vr is not None:
+                    s['vr'] = vr
+                    ported += 1
+        print('  OG->VR chain: {} fallback symbols gained VR offsets'.format(ported))
+
+    # Dedup by (name, version_key, offset) — one entry per version slot.
+    # Multi-version rows (e.g. RTTI with og+ae) are kept whole, so we dedup
+    # on the full tuple rather than a single version_key.
+    seen = set()
+    out = []
+    for s in collected:
+        vers = tuple(sorted((v, s[v]) for v in ('og', 'ng', 'ae', 'vr') if v in s))
+        if not vers:
+            continue
+        key = (s['n'],) + vers
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
 def main():
     import json as _json
 
@@ -2937,7 +3473,7 @@ def main():
         if id_val:
             sym['id'] = id_val
         _resolve(sym, id_val)
-        if 'ng' in sym or 'ae' in sym:
+        if any(k in sym for k in ('og', 'ng', 'ae', 'vr')):
             symbols.append(sym)
 
     for lbl in label_by_name.values():
@@ -2948,7 +3484,7 @@ def main():
         if id_val:
             sym['id'] = id_val
         _resolve(sym, id_val)
-        if 'ng' in sym or 'ae' in sym:
+        if any(k in sym for k in ('og', 'ng', 'ae', 'vr')):
             symbols.append(sym)
 
     # Normalize __ → :: in all names
@@ -2956,24 +3492,145 @@ def main():
         if '__' in s['n']:
             s['n'] = re.sub(r':{3,}', '::', s['n'].replace('__', '::'))
 
+    n_commonlib = len(symbols)
+
+    # Cross-version typed symbols from MasterModTemplate Shared/AddressLibraries.
+    # These carry OG+VR offsets (and sometimes signatures) that CommonLibF4 alone
+    # cannot provide, so they flow through the primary symbols list rather than
+    # the label-only fallback path.
+    fo4db_path = os.path.join(
+        SHARED_ANALYSIS_DIR, '..', 'AddressLibraries', 'Fallout4', 'fo4_database.csv')
+    fo4db_path = os.path.normpath(fo4db_path)
+    fo4db_entries = _load_fo4_database(fo4db_path)
+    print('  fo4_database.csv (status>=3): {}'.format(len(fo4db_entries)))
+    symbols.extend(fo4db_entries)
+
+    higgs_path = os.path.join(
+        SHARED_ANALYSIS_DIR, '..', 'AddressLibraries', 'Fallout4',
+        'new_address_contributions_resolved.csv')
+    higgs_path = os.path.normpath(higgs_path)
+    higgs_entries = _load_new_address_contributions(higgs_path)
+    print('  HIGGS/Daytripper contributions: {}'.format(len(higgs_entries)))
+    symbols.extend(higgs_entries)
+
+    # Byte-signature port: cross-version mappings produced by
+    # tools/run_bytesig_port.py — extends CommonLibF4 / fo4_database entries
+    # with version slots they didn't originally resolve in.
+    bytesig_path = os.path.join(
+        SHARED_ANALYSIS_DIR, 'CrossVersionMaps', 'fallout4_bytesig_map.csv')
+    bytesig_entries = _load_bytesig_map(bytesig_path)
+    print('  Byte-sig cross-version map: {}'.format(len(bytesig_entries)))
+    # Merge into existing symbols by name — bytesig rows enrich version slots
+    # on entries we already have, rather than appearing as standalone labels.
+    by_name = {}
+    for s in symbols:
+        by_name.setdefault(s['n'], s)
+    merged_from_bytesig = 0
+    for bs in bytesig_entries:
+        tgt = by_name.get(bs['n'])
+        if tgt is None:
+            symbols.append(bs)
+            by_name[bs['n']] = bs
+            continue
+        for k in ('og', 'ng', 'ae', 'vr'):
+            if k in bs and k not in tgt:
+                tgt[k] = bs[k]
+                merged_from_bytesig += 1
+    print('  Byte-sig merged {} new version slots into existing symbols'.format(merged_from_bytesig))
+
+    # Vtable-slot structural port: cross-version mappings produced by
+    # tools/run_vtable_port.py — names resolved via OG/VR PDB reverse-lookup
+    # onto the RTTI-walked slot grid, then propagated to all four versions.
+    vtmap_path = os.path.join(
+        SHARED_ANALYSIS_DIR, 'CrossVersionMaps', 'fallout4_vtable_map.csv')
+    vtmap_entries = _load_bytesig_map(vtmap_path)
+    # Retag source so the Ghidra comment field reflects provenance.
+    for e in vtmap_entries:
+        e['src'] = 'VTable_Port'
+    print('  Vtable cross-version map: {}'.format(len(vtmap_entries)))
+    merged_from_vtmap = 0
+    for vt in vtmap_entries:
+        tgt = by_name.get(vt['n'])
+        if tgt is None:
+            symbols.append(vt)
+            by_name[vt['n']] = vt
+            continue
+        for k in ('og', 'ng', 'ae', 'vr'):
+            if k in vt and k not in tgt:
+                tgt[k] = vt[k]
+                merged_from_vtmap += 1
+    print('  Vtable merged {} new version slots into existing symbols'.format(merged_from_vtmap))
+
+    # Label xref port: cross-version label RVAs extracted by decoding
+    # rip-relative xrefs inside byte-sig-ported functions
+    # (tools/run_label_xref_port.py).  Enriches data-label entries that
+    # otherwise only resolved in OG+VR.
+    xrefmap_path = os.path.join(
+        SHARED_ANALYSIS_DIR, 'CrossVersionMaps', 'fallout4_label_xref_map.csv')
+    xrefmap_entries = _load_bytesig_map(xrefmap_path)
+    for e in xrefmap_entries:
+        e['src'] = 'Label_XrefPort'
+    print('  Label xref cross-version map: {}'.format(len(xrefmap_entries)))
+    merged_from_xref = 0
+    for xe in xrefmap_entries:
+        tgt = by_name.get(xe['n'])
+        if tgt is None:
+            symbols.append(xe)
+            by_name[xe['n']] = xe
+            continue
+        for k in ('og', 'ng', 'ae', 'vr'):
+            if k in xe and k not in tgt:
+                tgt[k] = xe[k]
+                merged_from_xref += 1
+    print('  Label xref merged {} new version slots into existing symbols'.format(merged_from_xref))
+
+    # Dedup: keep first occurrence per (name, sorted version-offset tuple).
+    # CommonLibF4 entries are inserted first, so they win over fo4_database
+    # duplicates (CommonLibF4 sigs are richer than 'undefined X(...)').
+    seen = set()
+    deduped = []
+    for s in symbols:
+        vers = tuple(sorted((v, s[v]) for v in ('og', 'ng', 'ae', 'vr') if v in s))
+        key = (s['n'], vers)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(s)
+    symbols = deduped
+
     funcs = [s for s in symbols if s['t'] == 'func']
     with_sig = len([s for s in funcs if s.get('sig')])
     labels_count = len([s for s in symbols if s['t'] == 'label'])
+    n_og = len([s for s in symbols if 'og' in s])
     n_ng = len([s for s in symbols if 'ng' in s])
     n_ae = len([s for s in symbols if 'ae' in s])
-    print('\nGenerated {} symbols (NG/AE namespace):'.format(len(symbols)))
+    n_vr = len([s for s in symbols if 'vr' in s])
+    print('\nGenerated {} symbols ({} CommonLibF4 + {} external):'.format(
+        len(symbols), n_commonlib, len(symbols) - n_commonlib))
     print('  Functions: {} ({} with signatures)'.format(len(funcs), with_sig))
     print('  Labels: {}'.format(labels_count))
-    print('  Resolved per version — NG: {}, AE: {}'.format(n_ng, n_ae))
+    print('  Resolved per version — OG: {}, NG: {}, AE: {}, VR: {}'.format(
+        n_og, n_ng, n_ae, n_vr))
 
     symbols_json = _json.dumps(symbols, separators=(',', ':'))
 
+    # Load cross-version fallback symbols (F4NG named functions, F4SE/Planck VR
+    # offsets, optionally F4/F4VR public PDB dumps — see SHARED_ANALYSIS_DIR).
+    print('\n=== Loading fallback symbols ===')
+    fallbacks = load_fallback_symbols()
+    n_og = len([s for s in fallbacks if 'og' in s])
+    n_ng = len([s for s in fallbacks if 'ng' in s])
+    n_ae = len([s for s in fallbacks if 'ae' in s])
+    n_vr = len([s for s in fallbacks if 'vr' in s])
+    print('Fallback symbols — total: {} (OG: {}, NG: {}, AE: {}, VR: {})'.format(
+        len(fallbacks), n_og, n_ng, n_ae, n_vr))
+    fallback_json = _json.dumps(fallbacks, separators=(',', ':'))
+
     # NG (1.10.984) and AE (1.11.191) both resolve CommonLibF4 IDs.
-    # OG and VR scripts are still emitted but will be empty (disjoint
-    # ID namespaces) — they exist so downstream tooling sees the same
-    # four-script layout.
+    # OG and VR scripts get coverage via fallback symbols only (disjoint
+    # ID namespaces from CommonLibF4's AE-centric IDs).
     for version in ('f4og', 'f4ng', 'f4ae', 'f4vr'):
-        run_version(version, symbols_json, '[]')
+        run_version(version, symbols_json, fallback_json)
 
 
 if __name__ == '__main__':

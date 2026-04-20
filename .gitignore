@@ -8,6 +8,10 @@ _clang_stubs/
 ghidrascripts/
 pdbs/
 
+# Local tooling
+.claude/
+.mcp_probe.py
+
 # C extensions
 *.so
 
