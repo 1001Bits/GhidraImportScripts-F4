@@ -22,9 +22,9 @@ No build step — drop the `.py` into a Ghidra script directory and run.
 | Version | Exe | Primary symbols | Fallback symbols | Total |
 | --- | --- | ---: | ---: | ---: |
 | **F4 OG** (1.10.163) | `Fallout4.exe` | 107,703 | 180,468 | **288,171** |
-| **F4 NG** (1.10.984) | `Fallout4.exe` (unpacked) | 51,830 | 6,561 | 58,391 |
-| **F4 AE** (1.11.191) | `Fallout4.exe` (unpacked) | 65,248 | 6,221 | 71,469 |
-| **F4 VR** (1.2.72) | `Fallout4VR.exe` (unpacked) | 104,517 | 62,648 | **167,165** |
+| **F4 NG** (1.10.984) | `Fallout4.exe` | 51,830 | 6,561 | 58,391 |
+| **F4 AE** (1.11.191) | `Fallout4.exe` | 65,248 | 6,221 | 71,469 |
+| **F4 VR** (1.2.72) | `Fallout4VR.exe` | 104,517 | 62,648 | **167,165** |
 
 Every script also applies 415 enums, 2,910 structs, and 295 vtables with
 typed function-pointer slots under `/CommonLibF4/` in the DTM.
