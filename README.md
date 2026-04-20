@@ -32,7 +32,7 @@ typed function-pointer slots under `/CommonLibF4/` in the DTM.
 **Primary symbols** come from CommonLibF4 `REL::ID()` annotations, RTTI and
 VTABLE tables, and status≥3 entries from the community address database.
 **Fallback symbols** come from F4OG + F4VR Microsoft PDB public functions
-and the HIGGS contributions CSV.  Cross-version coverage is extended by a
+and the Heisenberg contributions CSV.  Cross-version coverage is extended by a
 byte-signature porting pass (wildcards rel32 / rip-rel displacements) and
 a label-xref porting pass using the call graph.
 
@@ -80,7 +80,7 @@ The generator expects these under `addresslibrary/`:
 - `Shared/AddressLibraries/Fallout4/fo4_database.csv` — community name
   database for OG + VR
 - `Shared/AddressLibraries/Fallout4/new_address_contributions_resolved.csv`
-  — HIGGS contributions
+  — Heisenberg contributions
 - `Shared/GhidraAnalysis/F4VR_Exports/f4_pdb_pub_functions.txt` — OG PDB
   public functions (~187k names)
 - `Shared/GhidraAnalysis/F4VR_Exports/f4vr_pdb_pub_functions.txt` — VR
