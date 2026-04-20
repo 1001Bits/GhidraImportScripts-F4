@@ -55,10 +55,3 @@ The generator expects these under `addresslibrary/`:
 2. Add `ghidrascripts/` to the bundle paths.
 3. Select the script matching your Fallout4.exe version and run.  Apply
    to the target binary.
-
-## Credits
-
-- Original generator design: [doodlum/GhidraImportScripts](https://github.com/doodlum/GhidraImportScripts)
-  (fancierimport branch).
-- CommonLibF4 headers: [alandtse/CommonLibF4](https://github.com/alandtse/CommonLibF4).
-- Fallout 4 Address Library: [meh321](https://www.nexusmods.com/fallout4/mods/47327).
