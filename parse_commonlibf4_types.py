@@ -269,23 +269,60 @@ VERSIONS = {
         'defines':     ['-DFALLOUT=43', '-DFALLOUT_VERSION_MAJOR=1'],
         'pdb':         os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_F4OG_D.pdb'),
         'output':      os.path.join(OUTPUT_DIR, 'CommonLibImport_F4OG.py'),
+        'binary':      r'C:\Games\Fallout.4 1.10.163\Fallout4.exe',
     },
     'f4ng': {
         'defines':     ['-DFALLOUT=163', '-DFALLOUT_VERSION_MAJOR=1'],
         'pdb':         os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_F4NG_D.pdb'),
         'output':      os.path.join(OUTPUT_DIR, 'CommonLibImport_F4NG.py'),
+        'binary':      r'C:\Games\Steam\steamapps\content\app_377160\depot_377162\Fallout4.exe.unpacked.exe',
     },
     'f4ae': {
         'defines':     ['-DFALLOUT=163', '-DFALLOUT_VERSION_MAJOR=1'],
         'pdb':         os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_F4AE_D.pdb'),
         'output':      os.path.join(OUTPUT_DIR, 'CommonLibImport_F4AE.py'),
+        'binary':      r'C:\Games\Steam\steamapps\common\Fallout 4 AE\Fallout4.exe.unpacked.exe',
     },
     'f4vr': {
         'defines':     ['-DFALLOUT=43', '-DFALLOUT_VERSION_MAJOR=1', '-DFALLOUTVR'],
         'pdb':         os.path.join(SCRIPT_DIR, 'pdbs', 'GhidraImport_F4VR_D.pdb'),
         'output':      os.path.join(OUTPUT_DIR, 'CommonLibImport_F4VR.py'),
+        'binary':      r'C:\Games\Steam\steamapps\common\Fallout 4 VR\Fallout4VR.exe.unpacked.exe',
     },
 }
+
+
+def _compute_binary_canaries(binary_path, symbols, version_key, n=6, nbytes=32):
+    """Pick N well-spaced function symbols and return their byte signatures.
+
+    Returns a list of {rva, bytes(hex), name} dicts.  A short single-function
+    prologue collides easily across versions, so we check multiple canaries
+    at different RVAs — any mismatch aborts the run.
+    """
+    if not binary_path or not os.path.isfile(binary_path):
+        return []
+    try:
+        sys.path.insert(0, os.path.join(SCRIPT_DIR, 'tools'))
+        from bytesig_port import load_pe_text
+        _, text_rva, text = load_pe_text(binary_path)
+    except Exception:
+        return []
+    candidates = [s for s in symbols
+                  if version_key in s and s.get('t') == 'func' and s.get('n')]
+    candidates.sort(key=lambda s: int(s[version_key]))
+    if len(candidates) < n:
+        return []
+    step = max(1, len(candidates) // n)
+    picks = [candidates[i * step] for i in range(n)]
+    out = []
+    for s in picks:
+        rva = int(s[version_key])
+        off = rva - text_rva
+        if off < 0 or off + nbytes > len(text):
+            continue
+        out.append({'rva': rva, 'bytes': bytes(text[off:off + nbytes]).hex(),
+                    'name': s['n']})
+    return out
 
 # ---------------------------------------------------------------------------
 # PDB parser — DIA SDK via COM (primary), manual TPI stream (fallback)
@@ -1249,7 +1286,17 @@ def convert_sig_to_ghidra(sig, func_name):
         else:
             ghidra_params = this_param + ', ' + ghidra_params
 
-    return ret_type + ' ' + simple_name + '(' + ghidra_params + ')'
+    result = ret_type + ' ' + simple_name + '(' + ghidra_params + ')'
+    # Reject malformed protos — nested parens (function-pointer params we
+    # can't demangle) or angle brackets (template args we failed to replace)
+    # produce invalid C that neither strict parse nor sanitize fallback can
+    # recover.  Returning None skips the parse attempt entirely, keeping
+    # Ghidra's error dialog clean.
+    if result.count('(') != 1 or result.count(')') != 1:
+        return None
+    if '<' in result or '>' in result:
+        return None
+    return result
 
 
 _SAFE_TYPES = {
@@ -1342,7 +1389,50 @@ def sanitize_unknown_types(proto):
 
 GHIDRA_MERGED_FOOTER = '''\
 
+def _verify_binary():
+    """Check N byte-signature canaries against the open binary.
+
+    A single 16-byte prologue is not distinctive enough across F4 builds (AE
+    and OG share many (push rbx; sub rsp, 0x50; movaps ...) prologues at
+    different RVAs).  We sample multiple symbols at different RVAs and
+    require every sample to match."""
+    if not VERSION_CANARY:
+        return True
+    canaries = VERSION_CANARY if isinstance(VERSION_CANARY, list) else [VERSION_CANARY]
+    base = currentProgram.getImageBase()
+    mem = currentProgram.getMemory()
+    fails = []
+    for c in canaries:
+        expected = bytearray.fromhex(c['bytes'])
+        addr = base.add(c['rva'])
+        try:
+            actual = bytearray(len(expected))
+            for i in range(len(expected)):
+                actual[i] = mem.getByte(addr.add(i)) & 0xFF
+            actual_hex = bytes(actual).hex()
+        except Exception:
+            actual_hex = 'UNREADABLE'
+        if actual_hex != c['bytes']:
+            fails.append((c, actual_hex))
+    if fails:
+        print('VERSION GUARD: binary mismatch for ' + VERSION.upper() +
+              ' ({}/{} canaries failed).'.format(len(fails), len(canaries)))
+        for c, actual_hex in fails[:3]:
+            print('  {} @ 0x{:x}: expected {}'.format(c['name'], c['rva'], c['bytes']))
+            print('                  actual   {}'.format(actual_hex))
+        print('This script will NOT run on this binary.  Pick the script matching your exe:')
+        print('  CommonLibImport_F4OG.py  -> Fallout4.exe 1.10.163')
+        print('  CommonLibImport_F4NG.py  -> Fallout4.exe 1.10.984 / 1.11.191 (unpacked)')
+        print('  CommonLibImport_F4AE.py  -> Fallout4.exe AE (unpacked)')
+        print('  CommonLibImport_F4VR.py  -> Fallout4VR.exe 1.2.72 (unpacked)')
+        return False
+    return True
+
+
 def run():
+    if not _verify_binary():
+        return
+
     # Pass 1: import type definitions (enums, vtable structs, struct fields)
     # Use a DTM transaction to defer GUI updates until the end.
     tx_types = dtm.startTransaction('Import CommonLib types')
@@ -1701,10 +1791,23 @@ def _import_vtable_names():
                         proto = (_type_to_c(slot_ret) + ' ' + slot_name +
                                  '(' + ', '.join(param_parts) + ')')
                         proto = _patch_templates(proto)
-                        func_def = CParserUtils.parseSignature(None, currentProgram,
-                            C_TYPE_PRELUDE + '\\n' + proto if C_TYPE_PRELUDE else proto, True)
-                        if func_def:
-                            ApplyFunctionSignatureCmd(func_addr, func_def,
+                        # CParserUtils.parseSignature accepts exactly one sig —
+                        # prepending C_TYPE_PRELUDE with typedefs breaks parsing.
+                        # Preflight against the DTM-known set and fall back to
+                        # sanitize_unknown_types when needed.
+                        fd = None
+                        if _proto_parseable(proto):
+                            try:
+                                fd = CParserUtils.parseSignature(None, currentProgram, proto, True)
+                            except Exception:
+                                fd = None
+                        if fd is None:
+                            try:
+                                fd = CParserUtils.parseSignature(None, currentProgram, sanitize_unknown_types(proto), True)
+                            except Exception:
+                                fd = None
+                        if fd is not None:
+                            ApplyFunctionSignatureCmd(func_addr, fd,
                                 SourceType.USER_DEFINED, True, False).applyTo(currentProgram)
                     except Exception:
                         pass
@@ -1832,13 +1935,17 @@ run()
 '''
 
 
-def generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, fallback_symbols_json='[]', c_prelude='', template_source=''):
+def generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, fallback_symbols_json='[]', c_prelude='', template_source='', canary=None):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     lines = [GHIDRA_MERGED_HEADER]
 
     # VERSION constant — hard-coded per file
     lines.append('VERSION = {}'.format(repr(version)))
+    # VERSION_CANARY — (rva, expected 16-byte hex, source-symbol name).  At
+    # script startup we read 16 bytes at this RVA from the open Ghidra program
+    # and abort if they don't match, preventing the wrong-binary foot-gun.
+    lines.append('VERSION_CANARY = {}'.format(repr(canary)))
     lines.append('')
 
     # Emit VTABLES
@@ -2962,8 +3069,26 @@ def run_version(version, symbols_json, fallback_symbols_json='[]'):
     except ImportError:
         template_source = ''
 
+    # Pick a canary symbol from the symbols list so the script can refuse to
+    # run on the wrong binary.  Scan for the first symbol with an RVA for this
+    # version + compute its 16 bytes from the corresponding PE.
+    version_key = {'f4og': 'og', 'f4ng': 'ng', 'f4ae': 'ae', 'f4vr': 'vr'}[version]
+    canaries = []
+    try:
+        import json as _json_mod
+        _syms = _json_mod.loads(symbols_json)
+        canaries = _compute_binary_canaries(cfg.get('binary'), _syms, version_key)
+    except Exception:
+        canaries = []
+    if canaries:
+        print('Canaries ({}):'.format(len(canaries)))
+        for c in canaries:
+            print('  {} @ 0x{:x} -> {}...'.format(c['name'], c['rva'], c['bytes'][:16]))
+    else:
+        print('Canaries: NOT AVAILABLE (binary missing or too few symbols) — version guard disabled')
+
     print('Generating Ghidra script...')
-    n_enums, n_structs = generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, fallback_symbols_json, c_prelude, template_source)
+    n_enums, n_structs = generate_script(enums, structs, vtable_structs, output_path, version, symbols_json, fallback_symbols_json, c_prelude, template_source, canary=canaries)
     print('Output: {} ({} enums, {} structs)'.format(output_path, n_enums, n_structs))
 
 
